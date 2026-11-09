@@ -1,4 +1,22 @@
     #!/bin/bash
+    # =====================================================================================
+    # BoilerStorm 2026 - cai-db01 (Ubuntu database + application server) edition
+    # Reviewed so running it will not sink the scored database service. Every point-saving
+    # change is tagged "BOILERSTORM/cai-db01 SAFETY" so you can find/revert them.
+    #
+    # SAFE to automate on the DB box:
+    #   2 Delete Files (now REPORT-ONLY), 3 Set Permissions, 4 Baseline, 7 Packages &
+    #   Services (DB/SSH/web packages protected from the purge), 8 Harden Kernel,
+    #   9 Sudoers, 10 Prevent Cron, 15 Network Config, 16 Systemd Config,
+    #   17 Security Tools (ufw now opens SSH + DB ports first), 1 Upgrade/Update*.
+    #   * run upgrades EARLY, not during a scoring check - a DB restart can cost uptime.
+    # REVIEW BEFORE RUNNING:
+    #   5 User Auditing (password/PCR + user-deletion risk), 6 Password Policies (PAM stack
+    #   rewrites disabled; config files kept), 18 Malware Hunt (interactive).
+    #   11/12/13/14 are desktop/display-manager configs - no-ops on a headless server.
+    # DO NOT: change the hostname or 10.42.0.30 IP, block whole subnets, or change a scored
+    # account's password without first filing a PCR in Quotient.
+    # =====================================================================================
     #TODO
     #Configs for /etc/security/access.conf /etc/security/namespace.conf
     # Use https://github.com/carlospolop/PEASS-ng/tree/master/linPEAS to find suid and suig bits
@@ -266,17 +284,14 @@
             done
 
             # Confirm deletion after listing all files
+            # BOILERSTORM/cai-db01 SAFETY: deletion DISABLED. On a database/app server this
+            # search matches legitimate DB dumps, backups, app data and *.sh/*.txt files, and
+            # the keyword scan hits words like "password"/"users"/"dump" inside real data.
+            # Deleting any of it can break the scored database service. Report only; review
+            # and remove anything genuinely malicious by hand.
             if [ ${#files_to_delete[@]} -gt 0 ]; then
-                log "The following suspicious files were found:" yellow
+                log "Files matching the suspicious patterns (REVIEW MANUALLY - nothing deleted):" yellow
                 printf '%s\n' "${files_to_delete[@]}"
-                read -p "Do you want to start the deletion process? (y/n): " confirmation
-                if [[ "$confirmation" =~ [Yy] ]]; then
-                    for file in "${files_to_delete[@]}"; do
-                        confirm_delete "$file"
-                    done
-                else
-                    log "File deletion process aborted." yellow
-                fi
             else
                 log "No suspicious files found." yellow
             fi
@@ -381,13 +396,16 @@
     chattr -RVfia /etc
     # Fix perms for all service files
     find /etc/systemd/system/ -type f -exec chmod 640 {} \;
-    find /etc -type f -name "*.conf" -exec chmod 640 {} \;
-    find /etc -type f -name "*config" -exec chmod 640 {} \;
-    find /etc -type f -name "*.yml" -exec chmod 640 {} \;
+    # BOILERSTORM/cai-db01 SAFETY: exclude the database config trees. Forcing
+    # /etc/postgresql and /etc/mysql to root:root 640 stops the DB daemon from reading its
+    # own config on the next restart and takes the scored service down.
+    find /etc -type f -name "*.conf" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chmod 640 {} \;
+    find /etc -type f -name "*config" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chmod 640 {} \;
+    find /etc -type f -name "*.yml" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chmod 640 {} \;
     find /etc/systemd/system/ -type f -exec chown root:root {} \;
-    find /etc -type f -name "*.conf" -exec chown root:root {} \;
-    find /etc -type f -name "*config" -exec chown root:root {} \;
-    find /etc -type f -name "*.yml" -exec chown root:root {} \;
+    find /etc -type f -name "*.conf" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chown root:root {} \;
+    find /etc -type f -name "*config" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chown root:root {} \;
+    find /etc -type f -name "*.yml" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chown root:root {} \;
     # Set permissions for syslog
     chmod 0640 /var/log/syslog
 
@@ -632,6 +650,14 @@
     echo -e "remember=5\nretry=2\nenforce_for_root" | sudo tee /etc/security/pwhistory.conf
     echo -e "dir = /var/run/faillock\naudit\nsilent\nno_log_info\ndeny=4\nunlock_time=1800\nfail_interval=900\neven_deny_root\nadmin_group adm" | sudo tee /etc/security/faillock.conf
 
+    # BOILERSTORM/cai-db01 SAFETY: the block below rewrites the live PAM stacks verbatim.
+    # These exact lines include lockout-prone modules (pam_faillock even_deny_root,
+    # pam_securetty, pam_shells) and a typo (use_authok), any of which can break SSH/login
+    # auth for scored accounts and lock you out mid-competition. Disabled by default.
+    # The policy *config* files above (login.defs, pwquality.conf, pwhistory.conf,
+    # faillock.conf) are kept. To enforce complexity safely, edit /etc/pam.d/common-password
+    # by hand and TEST on the Guacamole console before trusting SSH.
+    if false; then
     # Add password complexity requirements to the common-password file
     echo -e "password requisite pam_pwquality.so difok=4 minlen=14 dcredit=-1 ucredit=-1 lcredit=-1 ocredit=-1 minclass=4 maxrepeat=3 gecoscheck=1 dictcheck=1 maxsequence=4 maxclassrepeat=4 usercheck=1 enforcing=1 enforce_for_root=1 usercheck=1 usersubstr=4 retry=3\npassword requisite pam_pwhistory.so remember=5 retry=2 enforce_for_root use_authtok\npassword [success=1 default=ignore] pam_unix.so yescrypt try_first_pass use_authok obscure shadow rounds=65536 remember=5\npassword requisite pam_deny.so\npassword required pam_permit.so" | sudo tee /etc/pam.d/common-password
 
@@ -661,6 +687,8 @@
     echo -e "@include common-auth\n@include common-account\n@include common-session" | sudo tee /etc/pam.d/chfn
 
     echo -e "auth    requisite       pam_nologin.so\nauth    required        pam_succeed_if.so user != root quiet_success\n@include common-auth\nauth    optional        pam_gnome_keyring.so\n@include common-account\nsession [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so close\nsession required        pam_loginuid.so\nsession [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so open\nsession optional        pam_keyinit.so force revoke\nsession required        pam_limits.so\nsession required        pam_env.so readenv=1\nsession required        pam_env.so readenv=1 user_readenv=1 envfile=/etc/default/locale\n@include common-session\nsession optional        pam_gnome_keyring.so auto_start\n@include common-password" | sudo tee /etc/pam.d/gdm-password
+
+    fi  # end BOILERSTORM-disabled PAM stack rewrite (reinstall below is harmless, kept)
 
     # reset the pam authentication modules
     apt install --reinstall libpam-modules 
@@ -701,8 +729,13 @@
 
     echo "Grub config finished"
 
-    echo -e "/        /          ext4    defaults                              1 1\n/home    /home      ext4    defaults,nosuid,noexec,nodev          1 2\n/tmp     /tmp       ext4    defaults,bind,nosuid,noexec,nodev     1 2\n/var     /var       ext4    defaults,bind,nosuid                  1 2\n/var/tmp  /var/tmp   ext4    defaults,nosuid,nodev,noexec         1 2\n/boot    /boot      ext4    defaults,nosuid,noexec,nodev          1 2\nnone     /run/shm   tmpfs   rw,noexec,nosuid,nodev                0 0\ntmpfs    /dev/shm    tmpfs   defaults,nosuid,nodev,noexec,ro      0 0\nproc /proc proc nosuid,nodev,noexec,hidepid=2,gid=proc 0 0" | sudo tee /etc/fstab
-    mount -a
+    # BOILERSTORM/cai-db01 SAFETY: DISABLED. This overwrites /etc/fstab with a hard-coded
+    # partition/bind-mount layout that almost certainly does not match this VM. A wrong
+    # fstab + "mount -a" can break /var (where the DB lives) or make the box unbootable
+    # after a revert = total loss. If you want to harden mount options, confirm the REAL
+    # layout first with `lsblk` / `findmnt` and edit by hand.
+    # echo -e "/ ... /etc/fstab   (disabled)
+    # mount -a
 
     systemctl disable autofs
     systemctl stop autofs
@@ -951,7 +984,8 @@
     'net.ipv4.conf.default.accept_source_route=0'
     'net.ipv4.conf.default.accept_redirects=0'
     'net.ipv4.conf.default.accept_local=0'
-    'net.ipv4.icmp_echo_ignore_all = 1'
+    'net.ipv4.icmp_echo_ignore_all = 0'
+    # BOILERSTORM/cai-db01 SAFETY: ^ ICMP/ping is a listed scored protocol - keep it = 0 (answer pings)
     'net.ipv4.icmp_echo_ignore_broadcasts = 1'
     'net.ipv4.icmp_ignore_bogus_error_responses = 1'
     'net.ipv4.ip_forward = 0'
@@ -1018,7 +1052,9 @@
     fi
     done
     # Turns on lockdown
-    echo "none integrity [confidentiality]" | sudo tee /sys/kernel/security/lockdown
+    # BOILERSTORM/cai-db01 SAFETY: kernel lockdown=confidentiality is irreversible without a
+    # reboot and can block legitimate DB/kernel operations; leave it off during the event.
+    # echo "none integrity [confidentiality]" | sudo tee /sys/kernel/security/lockdown
 
     echo "Kernel has been hardened"
     sysctl -p
@@ -1029,16 +1065,21 @@
     }
 
     networkConfig (){
-    echo -e "nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions dnssec\noptions edns0\noptions timeout:5\noptions attempts:3\noptions rotate" | sudo tee /etc/resolv.conf
+    # BOILERSTORM/cai-db01 SAFETY: internal DNS is the domain controller (CAI-DC01,
+    # 10.42.0.10). Pointing at 8.8.8.8 breaks resolution of closedai.com and can break the
+    # app. DNSSEC dropped because internal AD DNS may not serve it.
+    echo -e "nameserver 10.42.0.10\noptions edns0\noptions timeout:5\noptions attempts:3\noptions rotate" | sudo tee /etc/resolv.conf
 
     echo "127.0.0.1	localhost" > /etc/hosts
-    echo "127.0.1.1	ubuntu"  >> /etc/hosts
+    echo "127.0.1.1	cai-db01" >> /etc/hosts   # BOILERSTORM: keep the real hostname; renaming loses points
     echo "::1     ip6-localhost ip6-loopback" >> /etc/hosts
     echo "fe00::0 ip6-localnet" >> /etc/hosts
     echo "ff00::0 ip6-mcastprefix" >> /etc/hosts
     echo "ff02::1 ip6-allnodes" >> /etc/hosts
     echo "ff02::2 ip6-allrouters" >> /etc/hosts
-    echo "ALL: ALL" > /etc/hosts.deny
+    # BOILERSTORM/cai-db01 SAFETY: do NOT blanket-deny via tcpwrappers; "ALL: ALL" in
+    # hosts.deny can drop SSH and other scored connections. Left unset.
+    # echo "ALL: ALL" > /etc/hosts.deny
 
     # Think deprecated
     # echo -e "order bind,host\nmulti off\nnospoof on" > /etc/host.conf
@@ -1056,7 +1097,9 @@
         echo -e '[OOM]\nSwapUsedLimit=10%\nDefaultMemoryPressureLimit=10%\nDefaultMemoryPressureDurationSec=30' | sudo tee /etc/systemd/oomd.conf
 
         # Resolved config 
-        echo -e '[Resolve]\nDomains=~.\nDNS=1.1.1.1 1.0.0.1\nDNSOverTLS=yes\nFallbackDNS=8.8.8.8 8.8.4.4\nDNSSEC=yes\nLLMNR=no\nMulticastDNS=no\nCache=yes\nCacheMinSec=0\nCacheMaxSec=86400\nDNSStubListener=no' | sudo tee /etc/systemd/resolved.conf
+        # BOILERSTORM/cai-db01 SAFETY: use internal DNS (CAI-DC01 10.42.0.10); DoT/DNSSEC off
+        # because internal AD DNS will not serve them and resolution would fail.
+        echo -e '[Resolve]\nDNS=10.42.0.10\nDNSOverTLS=no\nFallbackDNS=\nDNSSEC=no\nLLMNR=no\nMulticastDNS=no\nCache=yes' | sudo tee /etc/systemd/resolved.conf
 
         # Journald config
         echo -e "[Journal]\nForwardToSyslog=yes\nCompress=yes\nStorage=persistent\nAudit=yes\nSeal=yes\nSplitMode=uid" | sudo tee /etc/systemd/journald.conf
@@ -1071,6 +1114,7 @@
         echo -e "[Coredump]\nStorage=none\nProcessSizeMax=0" | sudo tee /etc/systemd/coredump.conf
 
         # logind hidepid
+        mkdir -p /etc/systemd/system/systemd-logind.service.d
         echo -e "[Service]\nSupplementaryGroups=proc" > /etc/systemd/system/systemd-logind.service.d/hidepid.conf
 
         # limits config
@@ -1085,6 +1129,11 @@
     ufw reset
     ufw default deny incoming
     ufw default allow outgoing
+    # BOILERSTORM/cai-db01 SAFETY: open SSH and the DB ports BEFORE enabling, or the
+    # "deny incoming" default black-holes the scored database and your own SSH access.
+    ufw allow 22/tcp         # SSH (your access; may also be scored)
+    ufw allow 5432/tcp       # PostgreSQL (scored DB)
+    ufw allow 3306/tcp       # MySQL/MariaDB (scored DB)
     ufw allow http
     ufw allow https
     ufw logging on
@@ -1483,11 +1532,11 @@
                 "filebeat"
                 "logstash"
                 "samba"
-                "ssh"
+                # "ssh"       # BOILERSTORM/cai-db01 SAFETY: keep SSH (your access; may be scored)
                 "dovecot"
-                "postfix"
+                # "postfix"   # BOILERSTORM/cai-db01 SAFETY: keep in case the app relays mail
                 "endless-sky"
-                "apache2"
+                # "apache2"   # BOILERSTORM/cai-db01 SAFETY: keep (possible app/web front-end)
                 "wireshark"
                 "nmap"
                 "zmap"
@@ -1539,18 +1588,18 @@
                 "nfs"
                 "xinetd"
                 "smb"
-                "postgresql"
+                # "postgresql" # BOILERSTORM/cai-db01 SAFETY: THIS IS (likely) THE SCORED DB - never purge
                 "sftpd"
                 "vsftpd"
                 "ftp"
-                "mysql"
-                "php"
+                # "mysql"     # BOILERSTORM/cai-db01 SAFETY: THIS IS (likely) THE SCORED DB - never purge
+                # "php"       # BOILERSTORM/cai-db01 SAFETY: keep (possible app runtime)
                 "snmp"
                 "pop3"
                 "icmp"
                 "sendmail"
                 "bind9"
-                "nginx"
+                # "nginx"     # BOILERSTORM/cai-db01 SAFETY: keep (possible app/web front-end)
                 "telnet"
                 "rlogind"
                 "rshd"
@@ -1651,6 +1700,15 @@
     }
 
     userAudit() {
+    # ============================ BOILERSTORM/cai-db01 WARNING ============================
+    # This function RESETS EVERY user's password to a hard-coded default and ADDS/DELETES
+    # users based on a correct.txt roster. On a scored box that is dangerous:
+    #   * Changing a scored account's password WITHOUT first filing a Password Change
+    #     Request (PCR) in Quotient makes its SSH/service checks FAIL (packet Section 5).
+    #   * deluser --remove-home can delete a scored service account and its data.
+    # Do NOT run this on cai-db01 unless you know exactly which accounts are scored and have
+    # filed PCRs for them. It also requires a correct.txt roster file in the CWD.
+    # =====================================================================================
     # Validate username function
     validate_username() {
         local username="$1"
@@ -2013,6 +2071,3 @@
         echo "Invalid input. Please enter a valid number."
     fi
     done
-
-
-
