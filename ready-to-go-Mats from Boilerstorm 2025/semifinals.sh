@@ -1071,7 +1071,7 @@
     echo -e "nameserver 10.42.0.10\noptions edns0\noptions timeout:5\noptions attempts:3\noptions rotate" | sudo tee /etc/resolv.conf
 
     echo "127.0.0.1	localhost" > /etc/hosts
-    echo "127.0.1.1	cai-db01" >> /etc/hosts   # BOILERSTORM: keep the real hostname; renaming loses points
+    echo "127.0.1.1	$(hostname)" >> /etc/hosts   # BOILERSTORM: use the box's REAL current hostname; never hardcode/rename
     echo "::1     ip6-localhost ip6-loopback" >> /etc/hosts
     echo "fe00::0 ip6-localnet" >> /etc/hosts
     echo "ff00::0 ip6-mcastprefix" >> /etc/hosts
