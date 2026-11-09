@@ -1,0 +1,13 @@
+#!/bin/bash
+SHELL=/bin/bash
+date=$(date +%d-%H-%M)
+user=$(whoami)
+log=/var/log/user
+fname=$user-$date.log
+
+touch $log/.$fname
+chmod 600 $log/.$fname
+
+script -q $log/.$fname
+
+mv $log/.$fname $log/$fname

@@ -1,0 +1,20 @@
+@echo off
+setlocal enabledelayedexpansion
+
+set "folderPath=%USERPROFILE%\Downloads\Scripts"
+
+for %%f in ("%folderPath%\*.bat" "%folderPath%\*.ps1" "%folderPath%\*.psm1" "%folderPath%\*.reg") do (
+    echo Running %%f with admin permissions
+    if "%%~xf"==".bat" (
+        start "" "%%f"
+    ) else if "%%~xf"==".ps1" (
+        powershell -ExecutionPolicy Bypass -File "%%f"
+    ) else if "%%~xf"==".psm1" (
+        powershell -ExecutionPolicy Bypass -File "%%f"
+    ) else (
+        regedit /s "%%f"
+    )
+    timeout /t 1 >nul
+)
+
+endlocal
