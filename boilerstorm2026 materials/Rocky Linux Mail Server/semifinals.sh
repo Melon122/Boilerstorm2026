@@ -1,2073 +1,1798 @@
-    #!/bin/bash
-    # =====================================================================================
-    # BoilerStorm 2026 - cai-db01 (Ubuntu database + application server) edition
-    # Reviewed so running it will not sink the scored database service. Every point-saving
-    # change is tagged "BOILERSTORM/cai-db01 SAFETY" so you can find/revert them.
-    #
-    # SAFE to automate on the DB box:
-    #   2 Delete Files (now REPORT-ONLY), 3 Set Permissions, 4 Baseline, 7 Packages &
-    #   Services (DB/SSH/web packages protected from the purge), 8 Harden Kernel,
-    #   9 Sudoers, 10 Prevent Cron, 15 Network Config, 16 Systemd Config,
-    #   17 Security Tools (ufw now opens SSH + DB ports first), 1 Upgrade/Update*.
-    #   * run upgrades EARLY, not during a scoring check - a DB restart can cost uptime.
-    # REVIEW BEFORE RUNNING:
-    #   5 User Auditing (password/PCR + user-deletion risk), 6 Password Policies (PAM stack
-    #   rewrites disabled; config files kept), 18 Malware Hunt (interactive).
-    #   11/12/13/14 are desktop/display-manager configs - no-ops on a headless server.
-    # DO NOT: change the hostname or 10.42.0.30 IP, block whole subnets, or change a scored
-    # account's password without first filing a PCR in Quotient.
-    # =====================================================================================
-    #TODO
-    #Configs for /etc/security/access.conf /etc/security/namespace.conf
-    # Use https://github.com/carlospolop/PEASS-ng/tree/master/linPEAS to find suid and suig bits
-    # Look into USB_modeswitch.conf
-    # Look into /etc/systemd/sleep.conf
-    # maybe look into baselining pam stuff with hashes
-
-    log() {
-        local message="$1"
-        local color="${2:-default}"
-
-        case "$color" in
-            red) echo -e "\033[31m$message\033[0m" ;;    # Red for errors
-            green) echo -e "\033[32m$message\033[0m" ;;  # Green for success
-            yellow) echo -e "\033[33m$message\033[0m" ;; # Yellow for warnings
-            *) echo "$message" ;;                        # Default (no color)
-        esac
-    }
-
-    check_root() {
-        if [[ $EUID -ne 0 ]]; then
-            log "Error: This script must be run as root" red
-            exit 1
-        fi
-    }
-
-    # Function to confirm file deletion
-    confirm_delete() {
-        local file="$1"
-        if [ -z "$file" ]; then
-            log "Error: null file found in confirm_delete" red
-            exit 1
-        fi
-        read -p "Do you want to delete '$file'? (y/n): " file_confirmation
-        if [[ "$file_confirmation" =~ [Yy] ]]; then
-            rm -f "$file"
-            log "File '$file' deleted." yellow
-        else
-            log "File '$file' not deleted." yellow
-        fi
-    }
-
-    deleteFiles() {
-            local files_to_delete=()
-
-            # Get the current logged-in user
-            local current_user
-            current_user=$(logname 2>/dev/null || echo "$SUDO_USER")
-
-            log "Starting file search process..." green
-
-            # Define user directories to search
-            local search_dirs=(
-                "/home/$current_user/Desktop"
-                "/home/$current_user/Documents"
-                "/home/$current_user/Downloads"
-                "/home/$current_user/Music"
-                "/home/$current_user/Pictures"
-                "/home/$current_user/Videos"
-                "/home/$current_user/Public"
-                "/home/$current_user/Templates"
-                "/lib/.core"
-            )
-
-            # Build comprehensive exclusion patterns
-            # Update the exclude_dirs array to include hidden directories in home
-            local exclude_dirs=(
-                "/home/*/.cache/*"
-                "/home/*/.config/*"
-                "/home/*/.local/*"
-                "/home/*/.mozilla/*"
-                "/home/*/.chrome/*"
-                "/home/*/.chromium/*"
-                "/home/*/.ssh/"
-                "/home/*/.gnupg/*"
-                "/home/*/snap/*"
-                "/home/*/.cargo/*"
-                "/home/*/.rustup/*"
-                "/home/*/.npm/*"
-                "/home/*/.nvm/*"
-                "/home/*/.pyenv/*"
-                "/home/*/.conda/*"
-                "/home/*/.wine/*"
-                "/home/*/.dbus/*"
-                "/home/*/.pulse/*"
-                "/home/*/.thunderbird/*"
-                "/home/*/.evolution/*"
-                "/home/*/.signal/*"
-                "/home/*/.zoom/*"
-                "/home/*/.teams/*"
-                "/home/*/.discord/*"
-                "/home/*/.slack/*"
-                "/home/*/.android/*"
-                "/home/*/.gradle/*"
-                "/home/*/.m2/*"
-                "/home/*/.dotnet/*"
-                "/home/*/.nuget/*"
-                "/home/*/.flutter/*"
-                "/home/*/.vscode/*"
-                "/home/*/.vscodium/*"
-                "/home/*/.sublime-text/*"
-                "/home/*/.atom/*"
-                "/home/*/.jetbrains/*"
-                "/home/*/.intellij/*"
-                "/home/*/.pycharm/*"
-                "/home/*/.webstorm/*"
-                "/home/*/.aws/*"
-                "/home/*/.azure/*"
-                "/home/*/.google/*"
-                "/home/*/.docker/*"
-                "/home/*/.kubernetes/*"
-                "/home/*/.putty/*"
-                "/home/*/.gnome/*"
-                "/opt/google/*"
-                "/opt/mozilla/*"
-            )
-
-            local exclude_files=(
-                ".bashrc"
-                ".bash_logout"
-                ".profile"
-                ".bash_history"
-                ".viminfo"
-                ".lesshst"
-                ".ssh"
-                ".gnupg"
-            )
-
-            # Build find command exclusions
-            local exclude_pattern=""
-            for dir in "${exclude_dirs[@]}"; do
-                exclude_pattern="$exclude_pattern -not -path '$dir/*'"
-            done
-
-            local exclude_files_pattern=""
-            for file in "${exclude_files[@]}"; do
-                exclude_files_pattern="$exclude_files_pattern -not -name '$file'"
-            done
-
-            # Build the search paths string
-            local search_paths="/opt /home"
-            for dir in "${search_dirs[@]}"; do
-                if [ -d "$dir" ]; then
-                    search_paths="$search_paths $dir"
-                fi
-            done
-
-            # Search for media files with exclusions
-            log "Searching for suspicious media files..." yellow
-            
-            # Media files
-            media_files=$(eval find $search_paths -type f \( \
-                -name "*.midi" -o -name "*.mid" -o -name "*.mod" -o \
-                -name "*.mp3" -o -name "*.mp2" -o -name "*.mpa" -o \
-                -name "*.m4a" -o -name "*.abs" -o -name "*.mpega" -o \
-                -name "*.au" -o -name "*.snd" -o -name "*.wav" -o \
-                -name "*.aiff" -o -name "*.aif" -o -name "*.sid" -o \
-                -name "*.flac" -o -name "*.ogg" -o -name "*.aac" -o \
-                \
-                -name "*.mpeg" -o -name "*.mpg" -o -name "*.mpe" -o \
-                -name "*.dl" -o -name "*.movie" -o -name "*.movi" -o \
-                -name "*.mv" -o -name "*.iff" -o -name "*.anim5" -o \
-                -name "*.anim3" -o -name "*.anim7" -o -name "*.avi" -o \
-                -name "*.vfw" -o -name "*.avx" -o -name "*.fli" -o \
-                -name "*.flc" -o -name "*.mov" -o -name "*.qt" -o \
-                -name "*.spl" -o -name "*.swf" -o -name "*.dcr" -o \
-                -name "*.dir" -o -name "*.dxr" -o -name "*.rpm" -o \
-                -name "*.rm" -o -name "*.smi" -o -name "*.ra" -o \
-                -name "*.ram" -o -name "*.rv" -o -name "*.wmv" -o \
-                -name "*.asf" -o -name "*.asx" -o -name "*.wma" -o \
-                -name "*.wax" -o -name "*.wmx" -o -name "*.3gp" -o \
-                -name "*.mp4" -o -name "*.flv" -o -name "*.m4v" -o \
-                \
-                -name "*.tiff" -o -name "*.tif" -o -name "*.rs" -o \
-                -name "*.im1" -o -name "*.gif" -o -name "*.jpeg" -o \
-                -name "*.jpg" -o -name "*.jpe" -o -name "*.png" -o \
-                -name "*.rgb" -o -name "*.xwd" -o -name "*.xpm" -o \
-                -name "*.ppm" -o -name "*.pbm" -o -name "*.pgm" -o \
-                -name "*.pcx" -o -name "*.ico" -o -name "*.svg" -o \
-                -name "*.svgz" -o -name "*.bmp" -o -name "*.img" \) \
-                $exclude_pattern \
-                $exclude_files_pattern 2>/dev/null)
-
-            # Search for suspicious archive and compressed files
-            log "Searching for suspicious archive and compressed files..." yellow
-            archive_files=$(eval find $search_paths -type f \( \
-                -name "*.a" -o -name "*.ar" -o -name "*.cpio" -o -name "*.shar" -o \
-                -name "*.LBR" -o -name "*.iso" -o -name "*.lbr" -o -name "*.mar" -o \
-                -name "*.sbx" -o -name "*.tar" -o -name "*.br" -o -name "*.bz2" -o \
-                -name "*.F" -o -name "*.genozip" -o -name "*.gz" -o -name "*.lz" -o \
-                -name "*.lz4" -o -name "*.lzma" -o -name "*.lzo" -o -name "*.rz" -o \
-                -name "*.sfark" -o -name "*.sz" -o -name "*.xz" -o -name "*.z" -o \
-                -name "*.Z" -o -name "*.zst" -o -name "*.7z" -o -name "*.s7z" -o \
-                -name "*.aar" -o -name "*.ace" -o -name "*.afa" -o -name "*.alz" -o \
-                -name "*.apk" -o -name "*.arc" -o -name "*.ark" -o -name "*.cdx" -o \
-                -name "*.arj" -o -name "*.b1" -o -name "*.b6z" -o -name "*.ba" -o \
-                -name "*.bh" -o -name "*.cab" -o -name "*.car" -o -name "*.cfs" -o \
-                -name "*.cpt" -o -name "*.dar" -o -name "*.dd" -o -name "*.dgc" -o \
-                -name "*.dmg" -o -name "*.ear" -o -name "*.gca" -o -name "*.ha" -o \
-                -name "*.hki" -o -name "*.ice" -o -name "*.jar" -o -name "*.kgb" -o \
-                -name "*.lzh" -o -name "*.lha" -o -name "*.lzx" -o -name "*.pak" -o \
-                -name "*.partimg" -o -name "*.paq6" -o -name "*.paq7" -o -name "*.paq8" -o \
-                -name "*.pea" -o -name "*.phar" -o -name "*.pim" -o -name "*.pit" -o \
-                -name "*.qda" -o -name "*.rar" -o -name "*.rk" -o -name "*.sda" -o \
-                -name "*.sea" -o -name "*.sen" -o -name "*.sfx" -o -name "*.shk" -o \
-                -name "*.sit" -o -name "*.sitx" -o -name "*.sqx" -o -name "*.tgz" -o \
-                -name "*.tbz2" -o -name "*.tlz" -o -name "*.txz" -o -name "*.uc" -o \
-                -name "*.uc0" -o -name "*.uc2" -o -name "*.ucn" -o -name "*.ur2" -o \
-                -name "*.ue2" -o -name "*.uca" -o -name "*.uha" -o -name "*.war" -o \
-                -name "*.wim" -o -name "*.xar" -o -name "*.xp3" -o -name "*.yz1" -o \
-                -name "*.zip" -o -name "*.zipx" -o -name "*.zoo" -o -name "*.zpaq" -o \
-                -name "*.zz" \) \
-                $exclude_pattern \
-                $exclude_files_pattern 2>/dev/null)
-
-            # Search for data recovery and other suspicious files
-            log "Searching for data recovery and other suspicious files..." yellow
-            other_files=$(eval find $search_paths -type f \( \
-                -name "*.ecc" -o -name "*.ecsbx" -o -name "*.par" -o -name "*.par2" -o \
-                -name "*.rev" -o -name "*.bak" -o -name "*.tib" -o -name "*.vhd" -o \
-                -name "*.vmdk" -o -name "*.msi" -o -name "*.hqx" -o \
-                -name "*.txt" -o -name "*.exe" -o -name "*.msi" -o \
-                -name "*.bat" -o -name "*.sh" \) \
-                $exclude_pattern \
-                $exclude_files_pattern 2>/dev/null)
-
-            # Process found files
-            for files in "$media_files" "$archive_files" "$other_files"; do
-                if [ -n "$files" ]; then
-                    while IFS= read -r file; do
-                        if [[ ! " ${files_to_delete[@]} " =~ " ${file} " ]]; then
-                            files_to_delete+=("$file")
-                            log "Suspicious file found: $file" red
-                        fi
-                    done <<< "$files"
-                fi
-            done
-
-            # Search for files with suspicious keywords, with exclusions
-            log "Searching for files containing suspicious keywords..." yellow
-            keywords=("shell" "secret" "password" "pw" "games" "users" "ploit" "sniff" "crack" 
-                    "malware" "rat" "backdoor" "rootkit" "inject" "hack" "keylogger" "trojan" 
-                    "attack" "hash" "vuln" "ware" "brute" "payload" "dump" "phish")
-            
-            for keyword in "${keywords[@]}"; do
-                log "Searching for files containing the keyword '$keyword'..." yellow
-                found_files=$(eval find $search_paths -type f \
-                    $exclude_pattern \
-                    $exclude_files_pattern \
-                    -exec grep -li "$keyword" {} + 2>/dev/null)
-                
-                if [ -n "$found_files" ]; then
-                    while IFS= read -r file; do
-                        if [[ ! " ${files_to_delete[@]} " =~ " ${file} " ]] && \
-                        [[ ! "$file" =~ \.cache/ ]] && \
-                        [[ ! "$file" =~ \.config/ ]] && \
-                        [[ ! "$file" =~ \.local/ ]] && \
-                        [[ ! "$file" =~ \.mozilla/ ]] && \
-                        [[ ! "$file" =~ snap/ ]]; then
-                            files_to_delete+=("$file")
-                            log "Suspicious file found: $file" red
-                        fi
-                    done <<< "$found_files"
-                fi
-            done
-
-            # Confirm deletion after listing all files
-            # BOILERSTORM/cai-db01 SAFETY: deletion DISABLED. On a database/app server this
-            # search matches legitimate DB dumps, backups, app data and *.sh/*.txt files, and
-            # the keyword scan hits words like "password"/"users"/"dump" inside real data.
-            # Deleting any of it can break the scored database service. Report only; review
-            # and remove anything genuinely malicious by hand.
-            if [ ${#files_to_delete[@]} -gt 0 ]; then
-                log "Files matching the suspicious patterns (REVIEW MANUALLY - nothing deleted):" yellow
-                printf '%s\n' "${files_to_delete[@]}"
-            else
-                log "No suspicious files found." yellow
-            fi
-
-            log "File search process completed." green
-        }
-
-
-    gnomeSettings (){
-    echo "Doing gnome settings"
-    # Set screen idle timeout to 5 minutes (300 seconds)
-    gsettings set org.gnome.desktop.session idle-delay 300
-
-    # Enable screen dimming during inactivity
-    gsettings set org.gnome.desktop.session idle-dim true
-
-    # Lock the screen on suspend
-    gsettings set org.gnome.desktop.session screensaver-ubuntu-lock-on-suspend true
-
-    # Lock the screen on suspend or hibernate
-    gsettings set org.gnome.desktop.session screensaver-ubuntu-lock-on-suspend-hibernate true
-
-    # Disable automatic saving of the session on logout
-    gsettings set org.gnome.desktop.session auto-save-session false
-
-    # Disable the "Restart" menu item
-    gsettings set org.gnome.desktop.session disable-log-out-restart true
-
-    # Disable the "Shutdown" menu item
-    gsettings set org.gnome.desktop.session disable-log-out-shutdown true
-
-    # Disable the "Suspend" menu item
-    gsettings set org.gnome.desktop.session disable-log-out-suspend true
-
-    # Disable the "Switch User" menu item
-    gsettings set org.gnome.desktop.session disable-log-out-switch-user true
-
-    # Disable the user switch menu
-    gsettings set org.gnome.desktop.session disable-log-out-user-switch-menu true
-
-    # Disable the fallback session menu
-    gsettings set org.gnome.desktop.session show-fallback-session-menu false
-
-    # Disable showing the real name on the session menu
-    gsettings set org.gnome.desktop.session show-real-name-on-session-menu false
-    
-    # Screen Locking
-    gsettings set org.gnome.desktop.screensaver lock-enabled true
-    gsettings set org.gnome.desktop.screensaver lock-delay 0
-
-    # Power Management
-    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 0
-    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 0
-
-    # Disable Guest Session
-    gsettings set org.gnome.desktop.session disable-user-list true
-
-    # Disable Automatic Mounting of External Media
-    gsettings set org.gnome.desktop.media-handling automount false
-    gsettings set org.gnome.desktop.media-handling automount-open false
-
-    # Privacy
-    gsettings set org.gnome.desktop.privacy report-technical-problems false
-    gsettings set org.gnome.desktop.privacy report-crash-dialog false
-
-    # File Handling
-    gsettings set org.gnome.desktop.background.show-desktop-icons false
-    gsettings set org.gnome.desktop.thumbnail-cache maximum-size 0
-    gsettings set org.gnome.nautilus.preferences default-folder-viewer 'list-view'
-
-    # Network
-    gsettings set org.gnome.nm-applet suppress-wireless-networks-available true
-
-    # Disable Bluetooth
-    gsettings set org.gnome.desktop.peripherals.bluetooth active false
-
-    # GNOME Shell
-    gsettings set org.gnome.shell favorite-apps "['firefox.desktop', 'org.gnome.Terminal.desktop']"
-    gsettings set org.gnome.shell.app-switcher current-workspace-only true
-
-    # Disable Shell Extensions (modify based on your needs)
-    gsettings set org.gnome.shell enabled-extensions "[]"
-
-    # Input Method
-    gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us')]"
-
-    # Accessibility
-    gsettings set org.gnome.desktop.a11y always-show-universal-access-status true
-
-    gsettings set org.gnome.software download-updates true
-
-    gsettings set org.gnome.settings-daemon.plugins.media-keys logout "''"
-
-    echo "Security-enhanced GNOME settings applied successfully."
-
-    # Look into dconf update
-    }
-
-    setPermissions (){
-    # Remove immutables and append only from home and etc
-    chattr -RVfia /home
-    chattr -RVfia /etc
-    # Fix perms for all service files
-    find /etc/systemd/system/ -type f -exec chmod 640 {} \;
-    # BOILERSTORM/cai-db01 SAFETY: exclude the database config trees. Forcing
-    # /etc/postgresql and /etc/mysql to root:root 640 stops the DB daemon from reading its
-    # own config on the next restart and takes the scored service down.
-    find /etc -type f -name "*.conf" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chmod 640 {} \;
-    find /etc -type f -name "*config" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chmod 640 {} \;
-    find /etc -type f -name "*.yml" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chmod 640 {} \;
-    find /etc/systemd/system/ -type f -exec chown root:root {} \;
-    find /etc -type f -name "*.conf" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chown root:root {} \;
-    find /etc -type f -name "*config" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chown root:root {} \;
-    find /etc -type f -name "*.yml" -not -path '/etc/postgresql/*' -not -path '/etc/mysql/*' -exec chown root:root {} \;
-    # Set permissions for syslog
-    chmod 0640 /var/log/syslog
-
-    # Ensure the correct ownership for all mail files in /var/mail
-    chown root:mail /var/mail
-    chmod 2775 /var/mail
-
-    # Set restrictive permissions for individual mailbox files
-    find /var/mail/* -type f -exec chmod 600 {} \;
-
-    # Ensure subdirectories (if any) inherit secure permissions
-    find /var/mail/* -type d -exec chmod 2770 {} \;
-
-    # Set permissions and ownership for critical system files
-    chmod 644 /etc/passwd /etc/group
-    chown root:root /etc/passwd /etc/group
-
-    chmod 640 /etc/shadow /etc/gshadow
-    chown root:shadow /etc/shadow /etc/gshadow
-
-    chmod 600 /etc/passwd- /etc/group- /etc/gshadow-
-    chown root:root /etc/passwd- /etc/group- /etc/gshadow-
-
-    chmod 440 /etc/sudoers /etc/sudoers.d/*
-    chown root:root /etc/sudoers /etc/sudoers.d/*
-
-    chmod 600 /etc/securetty
-    chown root:root /etc/securetty
-
-    chmod 600 /etc/cron.allow /etc/at.allow /etc/crontab
-    chmod 600 /etc/sysctl.conf /etc/network/interfaces
-    chmod 600 ~/.bashrc ~/.bash_profile
-    chmod 600 /etc/security/access.conf /etc/security/limits.conf /etc/security/namespace.conf
-    chown root:root /etc/cron.allow /etc/at.allow /etc/crontab
-    chown root:root /etc/sysctl.conf /etc/network/interfaces
-    chown root:root ~/.bashrc ~/.bash_profile
-    chown root:root /etc/security/access.conf /etc/security/limits.conf /etc/security/namespace.conf
-
-    chmod 640 /var/log/*.log
-    chown root:root /var/log/*.log
-    chmod 755 /var/log
-
-    chmod 600 /swapfile
-    chown root:root /swapfile
-    chmod 755 /home
-    chown root:root /home
-    chmod 755 /etc
-    chown root:root /etc
-
-    chmod 644 /etc/environment /etc/shells /etc/login.defs /etc/adduser.conf /etc/deluser.conf
-    chown root:root /etc/environment /etc/shells /etc/login.defs /etc/adduser.conf /etc/deluser.conf
-
-    chmod 644 /etc/crontab /etc/hosts.allow /etc/hosts.deny /etc/hosts
-    chown root:root /etc/hosts.allow /etc/hosts.deny /etc/hosts
-
-    chmod 440 /etc/inetd.conf /etc/xinetd.conf
-    chmod 400 /etc/inetd.d
-
-    # Secure boot and module-related directories
-    chmod 700 /boot /usr/src /lib/modules /usr/lib/modules
-    chown root:root /boot/grub/grub.cfg
-    chmod 700 /boot/grub/grub.cfg
-    chown root:root /etc/grub.d
-    chmod 0755 /etc/grub.d
-    # in case grub is different directory
-    chown root:root /grub/grub.cfg
-    chmod 700 /grub/grub.cfg
-
-    # Secure user-specific SSH configurations
-    chmod 700 ~/.ssh
-    chmod 600 ~/.ssh/id_rsa
-    chmod 644 ~/.ssh/id_rsa.pub
-    chown -R root:root ~/.ssh
-
-    # Secure critical binaries and system directories
-    # chmod 755 /bin /sbin /usr/bin /usr/sbin
-    chown root:root /bin /sbin /usr/bin /usr/sbin
-    # Maybe just do this instead for binaries
-    sudo find /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin -perm /022 -type f -exec chmod 755 '{}' \;
-
-    # Secure lib directories and files
-    sudo find /lib /lib64 /usr/lib -perm /022 -type f -exec chmod 755 '{}' \;
-
-    # Secure temporary directories
-    chmod 1777 /tmp /var/tmp
-    chown root:root /tmp /var/tmp
-
-    # Remove immutable and append-only attributes
-    chattr -i /etc/passwd /etc/group /etc/shadow /etc/gshadow
-    chattr -a /etc/passwd /etc/group /etc/shadow /etc/gshadow
-
-    # Final cleanup to ensure no duplicate entries
-    chmod 644 /etc/passwd /etc/group
-    chmod 600 /etc/shadow /etc/gshadow
-    chown root:root /etc/passwd /etc/group
-    chown root:shadow /etc/shadow /etc/gshadow
-
-    # Ensure Sticky Bit on all world writaable files
-    # Look for no owner files
-    echo "files with no owner:"
-    find / -nouser -o -nogroup 2>/dev/null
-    # TODO baseline suids, suigs, world writable, world readable, sticky bits
-    # df --local -P | awk '{if (NR!=1) print $6}' | xargs -I '{}' find '{}' -xdev -type d \( -perm -0002 -a ! -perm -1000 \) 2>/dev/null | xargs -I '{}' chmod a+t '{}'
-
-    # baseline suids and suigs
-    # look at getfacl for everything and search for mask if so print out
-
-    # Find files or directories in /etc not owned by root
-    non_root_files=$(find /etc ! -user root 2>/dev/null)
-
-    # Check if any files were found
-    if [[ -n "$non_root_files" ]]; then
-        echo "ALERT: The following files or directories in /etc are not owned by root:"
-        echo "$non_root_files"
+#!/usr/bin/env bash
+# ==============================================================================
+# Rocky Linux CCDC Mail Server Security Baseline & Auditing Script
+# Target OS: Rocky Linux 8 / 9 (RHEL-compatible)
+# System Role: Mail Server (Postfix / Dovecot / Sendmail / Exim / Webmail)
+# Design: Audit-First, Conservative Hardening, Idempotent, Mail-Safe
+# ==============================================================================
+
+set -o pipefail
+
+# ==============================================================================
+# 1. INITIALIZATION, CONFIGURATION & BASELINE VARIABLES
+# ==============================================================================
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+readonly LOG_DIR="/var/log/ccdc_hardening"
+readonly LOG_FILE="${LOG_DIR}/baseline_${TIMESTAMP}.log"
+readonly BACKUP_ROOT="/var/backups/ccdc_hardening/${TIMESTAMP}"
+readonly USER_ROSTER_FILE="${SCRIPT_DIR}/users.txt"
+readonly SYSCTL_DROPIN="/etc/sysctl.d/99-ccdc-mail-baseline.conf"
+readonly SUDOERS_DROPIN="/etc/sudoers.d/99-ccdc-baseline"
+
+# Global Execution Mode:1 = Dry-Run (No changes applied), 0 = Live Mode
+DRY_RUN=1
+
+# Protected Mail & Infrastructure Services (Never auto-disable or purge)
+readonly PROTECTED_SERVICES=(
+    "sshd" "firewalld" "NetworkManager" "systemd-journald" "rsyslog" "crond"
+    "postfix" "dovecot" "sendmail" "exim" "cyrus-imapd" "opendkim" "opendmarc"
+    "spamassassin" "spamd" "clamd@scan" "clamav-milter" "amavisd" "sqlgrey"
+    "postgrey" "httpd" "nginx" "php-fpm" "mariadb" "mysqld" "postgresql"
+    "named" "unbound" "slapd" "sssd" "chronyd" "auditd" "polkit"
+)
+
+# Protected System & Mail Accounts (Never lock, delete, or alter shell)
+readonly PROTECTED_ACCOUNTS=(
+    "root" "bin" "daemon" "adm" "lp" "sync" "shutdown" "halt" "mail" "operator"
+    "games" "ftp" "nobody" "dbus" "systemd-coredump" "systemd-resolve" "tss"
+    "polkitd" "unbound" "sssd" "sshd" "chrony" "postfix" "dovecot" "dovenull"
+    "opendkim" "opendmarc" "spamd" "amavis" "clamupdate" "virusgroup" "vmail"
+    "apache" "nginx" "mysql" "postgres" "named" "ldap" "rpc" "rpcuser" "cockpit-ws"
+)
+
+# Common Mail Ports (TCP)
+readonly MAIL_PORTS_TCP=(25 465 587 110 143 993 995)
+
+# Detected Active Mail Components
+ACTIVE_MAIL_SERVICES=()
+ACTIVE_MAIL_PORTS=()
+IPV6_REQUIRED=0
+
+# ==============================================================================
+# 2. LOGGING AND REPORTING
+# ==============================================================================
+init_logging() {
+    if [[ $EUID -eq 0 ]]; then
+        mkdir -p "$LOG_DIR"
+        chmod 700 "$LOG_DIR"
+        touch "$LOG_FILE"
+        chmod 600 "$LOG_FILE"
     else
-        echo "All files and directories in /etc are owned by root."
+        LOG_FILE="/tmp/ccdc_baseline_${TIMESTAMP}.log"
+        touch "$LOG_FILE"
+        chmod 600 "$LOG_FILE"
     fi
-
-    # Define baseline directory and output directory for results
-    baseline_dir="/baselines"
-    output_dir="/baselines/results"
-    mkdir -p "$output_dir"
-
-    # Define categories and their criteria
-    declare -A categories=(
-        ["suid_files"]="find / -type f -perm /4000"
-        ["sgid_files"]="find / -type f -perm /2000"
-        ["sticky_bit_files"]="find / \\( -type d -o -type f \\) -perm /1000"
-        ["world_writable_files"]="find / -type f -perm -o+w"
-        ["suspicious_files"]="find / \\( -type f -o -type d \\) \\( -iname '*shell*' -o -iname '*secret*' -o -iname '*password*' -o -iname '*pw*' -o -iname '*games*' -o -iname '*users*' -o -iname '*ploit*' \\)"
-    )
-
-    # Iterate over categories
-    for category in "${!categories[@]}"; do
-        baseline_file="$baseline_dir/${category}.txt"
-        current_file="$output_dir/current_${category}.txt"
-        added_file="$output_dir/added_${category}.txt"
-        removed_file="$output_dir/removed_${category}.txt"
-        
-        # Generate current snapshot
-        echo "Generating current snapshot for $category..."
-        eval "${categories[$category]} 2>/dev/null" | sort > "$current_file"
-        
-        # Compare with baseline
-        echo "Comparing with baseline for $category..."
-        if [[ -f "$baseline_file" ]]; then
-            sort "$baseline_file" > "$baseline_file.sorted"
-            
-            # Find files in the current system but not in the baseline
-            comm -23 "$current_file" "$baseline_file.sorted" > "$added_file"
-            
-            # Find files in the baseline but not in the current system
-            comm -13 "$current_file" "$baseline_file.sorted" > "$removed_file"
-            
-            # Cleanup sorted baseline
-            rm "$baseline_file.sorted"
-        else
-            echo "Baseline for $category not found. Skipping comparison."
-        fi
-    done
-
-    echo "Comparison completed. Check results in $output_dir."
-
-    echo "Starting search for suspicious ACLs (may take a while)"
-    find / -path /proc -prune -o -path /sys -prune -o -path /dev -prune -o -path /run -prune -o -path /mnt -prune -o -type f -o -type d -print | while read -r file; do
-        if getfacl "$file" 2>/dev/null | grep -q "mask::"; then
-            echo "Non-normal ACL detected on: $file"
-            getfacl "$file"
-        fi
-    done
-
-    echo "Finished setting various permissions"
-
-    echo "basic scan output for immutables"
-    sudo find / -exec lsattr {} + 2>/dev/null | grep "\---i"
-    }
-
-    sudoersConfig (){
-    echo -e "Defaults\tenv_reset, timestamp_timeout=15\nDefaults\tsecure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\nDefaults\tmail_badpass\nDefaults\trequiretty\nDefaults\tuse_pty\nDefaults\tlecture=\"always\"\nDefaults\tlog_input,log_output\nDefaults\tpasswd_tries=3\nDefaults\tpasswd_timeout=1\nDefaults\ttty_tickets\nDefaults\tauthenticate\nDefaults\tlogfile=\"/var/log/sudo.log\"\nDefaults\tsyslog=authpriv\n\nroot ALL=(ALL:ALL) ALL\n%admin ALL=(ALL) ALL\n%sudo ALL=(ALL:ALL) ALL\n\n#includedir /etc/sudoers.d" | sudo tee /etc/sudoers
-
-    echo "#" | sudo tee /etc/sudoers.d/README
-
-    # Directory to check
-    SUDOERS_DIR="/etc/sudoers.d"
-
-    # Check if the directory exists
-    if [ ! -d "$SUDOERS_DIR" ]; then
-    echo "The directory $SUDOERS_DIR does not exist."
-    exit 1
-    fi
-
-    # Find all files or directories in sudoers.d excluding 'README'
-    find "$SUDOERS_DIR" -mindepth 1 -not -name "README" -print | while read -r ITEM; do
-    echo "Suspicious entry detected: $ITEM"
-    done
-
-    echo -e "Set developer_mode false\nSet disable_coredump true" | sudo tee /etc/sudo.conf
-
-    echo "Sudoers configuration updated."
-    }
-
-    lightDMConfig() {
-    config_file="/etc/lightdm/lightdm.conf"
-
-    # Ensure sections exist before modifying
-    ensure_section() {
-        local section=$1
-        grep -q "^\[$section\]" "$config_file" || echo -e "\n[$section]" | sudo tee -a "$config_file"
-    }
-
-    # Define configurations under the appropriate sections
-    declare -A configurations=(
-        ["Seat:*"]="allow-guest=false\ngreeter-hide-users=true\ngreeter-show-manual-login=true\nautologin-user=none"
-        ["UserList"]="minimum-uid=500\nhidden-users=nobody nobody4 noaccess\nhidden-shells=/bin/false /usr/sbin/nologin"
-    )
-
-    # Apply configuration updates
-    for section in "${!configurations[@]}"; do
-        ensure_section "$section"
-        while IFS= read -r line; do
-            key=$(echo "$line" | cut -d'=' -f1)
-            if grep -q "^$key=" "$config_file"; then
-                sudo sed -i "s|^$key=.*|$line|" "$config_file"
-            else
-                echo "$line" | sudo tee -a "$config_file"
-            fi
-        done <<< "${configurations[$section]}"
-    done
-
-    echo "LightDM configuration updated successfully."
-    }
-
-    passwordPolicies (){
-    # Login Defs config
-    echo -e "MAIL_DIR\t/var/mail\nFAILLOG_ENAB\tyes\nLOG_UNKFAIL_ENAB\tno\nLOG_OK_LOGINS\yes\nSYSLOG_SU_ENAB\tyes\nSYSLOG_SG_ENAB\tyes\nSULOG_FILE\t/var/log/sulog\nFTMP_FILE\t/var/log/btmp\nSU_NAME\tsu\nHUSHLOGIN_FILE\t.hushlogin\nENV_SUPATH\tPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nENV_PATH\tPATH=/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games\nTTYGROUP\ttty\nTTYPERM\t0600\nERASECHAR\t0177\nKILLCHAR\t025\nUMASK\t077\nPASS_MAX_DAYS\t90\nPASS_MIN_DAYS\t10\nPASS_WARN_AGE\t12\nUID_MIN\t1000\nUID_MAX\t60000\nGID_MIN\t1000\nGID_MAX\t60000\nLOGIN_RETRIES\t3\nLOGIN_TIMEOUT\t30\nCHFN_RESTRICT\tfrwh\nDEFAULT_HOME\tno\nUSERGROUPS_ENAB\tyes\nENCRYPT_METHOD\tSHA512" | sudo tee /etc/login.defs
-    
-    # Install libpam-cracklib
-    apt-get -y install libpam-pwquality
-    echo "Libpam-cracklib installed."
-
-    echo -e "difok=4\nminlen=14\ndcredit=-1\nucredit=-1\nlcredit=-1\nocredit=-1\nminclass=4\nmaxrepeat=4\nmaxsequence=3\nmaxclassrepeat=4\ngecoscheck=1\ndictcheck=1\nusercheck=1\nenforcing=1\nretry=3\nenforce_for_root=1\nusersubstr=4" | sudo tee /etc/security/pwquality.conf
-    echo -e "remember=5\nretry=2\nenforce_for_root" | sudo tee /etc/security/pwhistory.conf
-    echo -e "dir = /var/run/faillock\naudit\nsilent\nno_log_info\ndeny=4\nunlock_time=1800\nfail_interval=900\neven_deny_root\nadmin_group adm" | sudo tee /etc/security/faillock.conf
-
-    # BOILERSTORM/cai-db01 SAFETY: the block below rewrites the live PAM stacks verbatim.
-    # These exact lines include lockout-prone modules (pam_faillock even_deny_root,
-    # pam_securetty, pam_shells) and a typo (use_authok), any of which can break SSH/login
-    # auth for scored accounts and lock you out mid-competition. Disabled by default.
-    # The policy *config* files above (login.defs, pwquality.conf, pwhistory.conf,
-    # faillock.conf) are kept. To enforce complexity safely, edit /etc/pam.d/common-password
-    # by hand and TEST on the Guacamole console before trusting SSH.
-    if false; then
-    # Add password complexity requirements to the common-password file
-    echo -e "password requisite pam_pwquality.so difok=4 minlen=14 dcredit=-1 ucredit=-1 lcredit=-1 ocredit=-1 minclass=4 maxrepeat=3 gecoscheck=1 dictcheck=1 maxsequence=4 maxclassrepeat=4 usercheck=1 enforcing=1 enforce_for_root=1 usercheck=1 usersubstr=4 retry=3\npassword requisite pam_pwhistory.so remember=5 retry=2 enforce_for_root use_authtok\npassword [success=1 default=ignore] pam_unix.so yescrypt try_first_pass use_authok obscure shadow rounds=65536 remember=5\npassword requisite pam_deny.so\npassword required pam_permit.so" | sudo tee /etc/pam.d/common-password
-
-    # common-session
-    echo -e "session required pam_limits.so\nsession [default=1] pam_permit.so\nsession requisite pam_deny.so\nsession required pam_permit.so\nsession required pam_unix.so\nsession required pam_loginuid.so\nsession optional pam_tmpdir.so\nsession optional pam_umask.so umask=0022\nsession optional pam_systemd.so" | sudo tee /etc/pam.d/common-session
-
-    # common-session-noninteractive
-    echo -e "session [default=1] pam_permit.so\nsession requisite pam_deny.so\nsession required pam_permit.so\nsession optional pam_umask.so\nsession required pam_unix.so" | sudo tee /etc/pam.d/common-session-noninteractive
-
-    # common-account
-    echo -e "account required pam_faillock.so\naccount required pam_shells.so\naccount [success=1 new_authtok_reqd=done default=ignore] pam_unix.so\naccount requisite pam_deny.so\naccount required pam_access.so\naccount required pam_permit.so\naccount sufficient pam_localuser.so" | sudo tee /etc/pam.d/common-account
-    
-    # Account lockout policy
-    # /etc/pam.d/common-auth
-    echo -e "auth required pam_securetty.so\nauth required pam_shells.so\nauth required pam_faildelay.so delay=5000000\nauth required pam_faillock.so preauth silent audit deny=5 unlock_time=1800 fail_interval=500 even_deny_root\nauth [success=1 default=ignore] pam_unix.so\nauth [default=die] pam_faillock.so authfail preauth audit deny=4 unlock_time=1800 fail_interval=900 even_deny_root\nauth sufficient pam_faillock.so authsucc preauth audit deny=5 unlock_time=1800\nauth requisite pam_deny.so\nauth required pam_permit.so\nauth optional pam_cap.so" | sudo tee /etc/pam.d/common-auth
-
-    # /etc/pam.d/su
-    echo -e "auth       required   pam_wheel.so\nsession       required   pam_env.so readenv=1\nsession       required   pam_env.so readenv=1 envfile=/etc/default/locale\nsession    optional   pam_mail.so nopen\nsession    required   pam_limits.so\n@include common-auth\n@include common-account\n@include common-session" | sudo tee /etc/pam.d/su
-
-    # /etc/pam.d/sudo
-    echo -e "session    required   pam_limits.so\nsession    required   pam_env.so readenv=1 user_readenv=0\nsession    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0\n@include common-auth\n@include common-account\n@include common-session-noninteractive" | sudo tee /etc/pam.d/sudo
-
-    # /etc/pam.d/chsh
-    echo -e "auth       required   pam_shells.so\n@include common-auth\n@include common-account\n@include common-session" | sudo tee /etc/pam.d/chsh
-
-    # /etc/pam.d/chfn
-    echo -e "@include common-auth\n@include common-account\n@include common-session" | sudo tee /etc/pam.d/chfn
-
-    echo -e "auth    requisite       pam_nologin.so\nauth    required        pam_succeed_if.so user != root quiet_success\n@include common-auth\nauth    optional        pam_gnome_keyring.so\n@include common-account\nsession [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so close\nsession required        pam_loginuid.so\nsession [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so open\nsession optional        pam_keyinit.so force revoke\nsession required        pam_limits.so\nsession required        pam_env.so readenv=1\nsession required        pam_env.so readenv=1 user_readenv=1 envfile=/etc/default/locale\n@include common-session\nsession optional        pam_gnome_keyring.so auto_start\n@include common-password" | sudo tee /etc/pam.d/gdm-password
-
-    fi  # end BOILERSTORM-disabled PAM stack rewrite (reinstall below is harmless, kept)
-
-    # reset the pam authentication modules
-    apt install --reinstall libpam-modules 
-
-    echo "Pam config complete\nStarting password search (might take a while)"
-
-    # Prompt for two passwords to search
-    # echo "Enter the first password:"
-    # read word1
-    # echo "Enter the second password:"
-    # read word2
-
-    # # Check if both password were entered
-    # if [[ -z "$word1" || -z "$word2" ]]; then
-    #     echo "Both passwords must be provided. Exiting."
-    #     exit 1
-    # fi
-
-    # # Search the entire filesystem for files containing both words
-    # echo "Searching for files containing both '$word1' and '$word2'..."
-    # grep -rl "$word1" / | while read -r file; do
-    #     echo "Potentially suspicious password file: $file"
-    #     # Check if the second password is also in the file
-    #     if grep -q "$word2" "$file"; then
-    #         echo "Definitely suspicious password file: $file"
-    #     fi
-    # done
-
-    }
-
-
-    grubConfig (){
-    echo -e 'GRUB_TIMEOUT_STYLE=hidden\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2> /dev/null || echo Debian`\nGRUB_SAVEDEFAULT=true\nGRUB_DISABLE_LINUX_RECOVERY=true\nGRUB_ENABLE_CRYPTODISK=y\nGRUB_DISABLE_RECOVERY=true\nGRUB_TERMINAL_INPUT=console\nGRUB_DEFAULT=0\nGRUB_TIMEOUT=0\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash"\nGRUB_CMDLINE_LINUX="slab_nomerge audit=1 audit_backlog_limit=8192 init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 randomize_kstack_offset=on l1tf=full vsyscall=none oops=panic lockdown=confidentiality lsm=lockdown,yama force kvm.nx_huge_pages=force quiet loglevel=0 spec_store_bypass_disable=on spectre_v2=on tsx=off tsx_async_abort=full nosmt=force mds=full pti=on debugfs=off mce=0 apparmor=1 security=apparmor intel_iommu=on amd_iommu=on disable_early_pci_dma nousb mitigations=auto,nosmt slub_debug=FZP page_poison=1 noexec noirqbalance rodata=1 iommu.passthrough=0 iommu.strict=1 hardened_usercopy=on slab_common.usercopy_fallback=0 net.ifnames=0 l1d_flush=on seccomp=1 ipv6.disable=1"\nGRUB_DISABLE_OS_PROBER=true' | sudo tee /etc/default/grub
-
-
-    # echo "set check_signatures=enforce" | sudo tee -a /etc/grub.d/40_custom
-    # echo "export check_signatures" | sudo tee -a /etc/grub.d/40_custom
-
-    echo "Grub config finished"
-
-    # BOILERSTORM/cai-db01 SAFETY: DISABLED. This overwrites /etc/fstab with a hard-coded
-    # partition/bind-mount layout that almost certainly does not match this VM. A wrong
-    # fstab + "mount -a" can break /var (where the DB lives) or make the box unbootable
-    # after a revert = total loss. If you want to harden mount options, confirm the REAL
-    # layout first with `lsblk` / `findmnt` and edit by hand.
-    # echo -e "/ ... /etc/fstab   (disabled)
-    # mount -a
-
-    systemctl disable autofs
-    systemctl stop autofs
-
-    # Services to be removed
-    servicesInit=("chargen" "daytime" "discard" "echo" "time" "shell" "login" "exec" "talk" "ntalk" "telnet" "tftp")
-
-    # Loop through the services and remove them
-    for service in "${servicesInit[@]}"; do
-        sudo sed -i "/^$service/d" /etc/inetd.conf
-        sudo sed -i "/^$service/d" /etc/inetd.d/*
-    done
-
-        # Services to be disabled
-    servicesXinet=("chargen" "daytime" "discard" "echo" "time" "rsh" "rlogin" "rexec" "talk" "telnet" "tftp")
-
-    # Loop through the services and disable them in /etc/xinetd.conf and /etc/xinetd.d/*
-    for service in "${servicesXinet[@]}"; do
-        sudo sed -i "/^$service/s/disable[[:space:]]*=[[:space:]]*[^[:space:]]*/disable = yes/" /etc/xinetd.conf
-        sudo sed -i "/^$service/s/disable[[:space:]]*=[[:space:]]*[^[:space:]]*/disable = yes/" /etc/xinetd.d/*
-    done
-
-    systemctl disable xinetd
-    systemctl stop xinetd
-
-    # banner config
-
-        # Remove unwanted lines
-        sed -i '/\\[mrsv]/d' /etc/motd
-        sed -i '/Ubuntu/d' /etc/motd
-
-        chown root:root /etc/motd
-        chmod 644 /etc/motd
-
-        echo "Authorized uses only. All activity may be monitored and reported." > /etc/issue
-        echo "Authorized uses only. All activity may be monitored and reported." > /etc/issue.net
-
-        chown root:root /etc/issue
-        chmod 644 /etc/issue
-        chown root:root /etc/issue.net
-        chmod 644 /etc/issue.net
-    }
-    preventCronJobs() {
-    # Check and display the contents of /var/spool/cron/crontabs
-    echo "Listing files in /var/spool/cron/crontabs:"
-    ll /var/spool/cron/crontabs
-
-    echo -e "\nContents of crontab files:"
-    for file in /var/spool/cron/crontabs/*; do
-        if [ -f "$file" ]; then
-            echo -e "\n--- $file ---"
-            cat "$file"
-        else
-            echo -e "\nNo crontab files found."
-            break
-        fi
-    done
-
-    # Check and display the contents of at jobs
-    echo -e "\nListing files in /var/spool/at or /var/spool/atjobs (whichever exists):"
-    if [ -d "/var/spool/at" ]; then
-        ll /var/spool/at
-    elif [ -d "/var/spool/atjobs" ]; then
-        ll /var/spool/atjobs
-    else
-        echo "No at job directory found."
-    fi
-
-    echo -e "\nContents of at job files:"
-    for file in /var/spool/at/* /var/spool/atjobs/*; do
-        if [ -f "$file" ]; then
-            echo -e "\n--- $file ---"
-            cat "$file"
-        fi
-    done
-
-    systemctl enable cron
-    }
-
-    gdm3Config (){
-        # Configure GDM3
-    echo -e "# These are the options for the greeter session that can be set \n# through GSettings. Any GSettings setting that is used by the \n# greeter session can be set here.\n\n# Note that you must configure the path used by dconf to store the \n# configuration, not the GSettings path.\n\n# Theming options\n# ===============\n#  - Change the GTK+ theme\n[org/gnome/desktop/interface]\n# gtk-theme='Adwaita'\n#  - Use another background\n[org/gnome/desktop/background]\n# picture-uri='file:///usr/share/themes/Adwaita/backgrounds/stripes.jpg'\n# picture-options='zoom'\n#  - Or no background at all\n[org/gnome/desktop/background]\n# picture-options='none'\n# primary-color='#000000'\n\n# Login manager options\n# =====================\n[org/gnome/login-screen]\n#logo='/usr/share/images/vendor-logos/logo-text-version-64.png'\n\n# - Disable user list\ndisable-user-list=true\n# - Disable restart buttons\ndisable-restart-buttons=true\n# - Show a login welcome message\nbanner-message-enable=false\nbanner-message-text='Welcome'\n\n# Automatic suspend\n# =================\n[org/gnome/settings-daemon/plugins/power]\nsleep-inactive-ac-timeout=1200\nsleep-inactive-ac-type='suspend'\nsleep-inactive-battery-timeout=600\nsleep-inactive-battery-type='suspend'" | sudo tee /etc/gdm3/greeter.dconf-defaults
-    echo -e "[daemon]\nAutomaticLoginEnable=false\nAutomaticLogin=\n\n# Uncomment the line below to force the login screen to use Xorg\n#WaylandEnable=false\n\n[security]\nDisallowTCP=true\nAllowRoot=false\n\n[xdmcp]\nEnable=false\n\n[chooser]\n\n[debug]\nEnable=false" | sudo tee /etc/gdm3/custom.conf
-    echo -e "[com/ubuntu/SoftwareProperties]\nubuntu-pro-banner-visible=false\n\n[org/gnome/login-screen]\nallowed-failures='2'\nbanner-message-enable=false\ndisable-user-list=true\ndisable-restart-buttons=true\nenable-fingerprint-authentication=false\nenable-password-authentication=true\nenable-smartcard-authentication=false\n\n[org/gnome/online-accounts]\nwhitelisted-providers=['none']\n\n[org/gnome/system/location]\nenabled=false\n\n[org/gnome/deja-dup]\nperiodic=true\nperiodic-period='7'\n\n[org/gnome/desktop/privacy]\ndisable-camera=true\ndisable-microphone=true\ndisable-sound-output=false\nhide-identity=true\nold-files-age='30'\nprivacy-screen=true\nrecent-files-max-age='15'\nremember-app-usage=true\nremember-recent-files=true\nremove-old-trash-files=true\nreport-technical-problems=false\nsend-software-usage-stats=false\nshow-full-name-in-top-bar=false\nusb-protection=true\nusb-protection-level='always'\n\n[org/gnome/desktop/remote-desktop/rdp]\nenable=false\n\n[org/gnome/desktop/remote-desktop/vnc]\nenable=false\n\n[org/gnome/desktop/screensaver]\nlock-delay=uint32 0\nlock-enabled=true\nshow-full-name-in-top-bar=false\nstatus-message-enabled=false\nubuntu-lock-on-suspend=true\nuser-switch-enabled=false\n\n[org/gnome/desktop/media-handling]\nautomount=false\nautomount-open=false\nautorun-never=true\n\n[org/gnome/desktop/wm/preferences]\naudible-bell=false" | sudo tee /etc/dconf/db/database.d/00-security-hardening
-    echo -e "com/ubuntu/SoftwareProperties/ubuntu-pro-banner-visible\norg/gnome/login-screen/allowed-failures\norg/gnome/login-screen/banner-message-enable\norg/gnome/login-screen/disable-user-list\norg/gnome/login-screen/disable-restart-buttons\norg/gnome/login-screen/enable-fingerprint-authentication\norg/gnome/login-screen/enable-password-authentication\norg/gnome/login-screen/enable-smartcard-authentication\norg/gnome/online-accounts/whitelisted-providers\norg/gnome/system/location/enabled\norg/gnome/deja-dup/periodic\norg/gnome/deja-dup/periodic-period\norg/gnome/desktop/privacy/disable-camera\norg/gnome/desktop/privacy/disable-microphone\norg/gnome/desktop/privacy/disable-sound-output\norg/gnome/desktop/privacy/hide-identity\norg/gnome/desktop/privacy/old-files-age\norg/gnome/desktop/privacy/privacy-screensaver\norg/gnome/desktop/privacy/recent-files-max-age\norg/gnome/desktop/privacy/remember-app-usage\norg/gnome/desktop/privacy/remember-recent-files\norg/gnome/desktop/privacy/remove-old-trash-files\norg/gnome/desktop/privacy/report-technical-problems\norg/gnome/desktop/privacy/send-software-usage-stats\norg/gnome/desktop/privacy/show-full-name-in-top-bar\norg/gnome/desktop/privacy/usb-protection\norg/gnome/desktop/privacy/usb-protection-level\norg/gnome/desktop/remote-desktop/rdp/enable\norg/gnome/desktop/remote-desktop/vnc/enable\norg/gnome/desktop/screensaver/lock-delay\norg/gnome/desktop/screensaver/lock-enabled\norg/gnome/desktop/screensaver/show-full-name-in-top-bar\norg/gnome/desktop/screensaver/status-message-enabled\norg/gnome/desktop/screensaver/ubuntu-lock-on-suspend\norg/gnome/desktop/screensaver/user-switch-enabled\norg/gnome/desktop/media-handling/automount\norg/gnome/desktop/media-handling/automount-open\norg/gnome/desktop/media-handling/autorun-never\norg/gnome/desktop/wm/preferences/audible-bell" | sudo tee /etc/dconf/db/database.d/locks/00-security-hardening
-    }
-    kernelHarden (){
-    # Define the sysctl configuration file path
-    config_file="/etc/sysctl.conf"
-    # CHECK vm panic on oom
-    # Define an array of configurations to modify
-    configurations=(
-    'fs.file_max = 65535'
-    'fs.protected_fifos = 2'
-    'fs.protected_regular = 2'
-    'fs.suid_dumpable = 0'
-    'fs.protected_symlinks = 1'
-    'fs.protected_hardlinks = 1'
-    'fs.binfmt.misc.status=0'
-    'fs.inotify.max_user_watches = 524288'
-    'kernel.callhome=1'
-    'kernel.acpi_vide_flags=0'
-    'kernel.acct=4 2 30'
-    'kernel.debug.kprobes=0'
-    'kernel.io_uring_disabled=1'
-    'kernel.hung_task_panic=0'
-    'kernel.hotplug=/sbin/hotplug'
-    'kernel.hardlockup_panic=0'
-    'kernel.hardlockup_all_cpu_backtrace=1'
-    'kernel.ftrace_enabled=0'
-    'kernel.ftrace_dump_on_oops=0'
-    'kernel.overflowuid=65535'
-    'kernel.overflowgid=65535'
-    'kernel.numa_balancing=0'
-    'kernel.nmi_watchdog=1'
-    'kernel.msgmnb=65536'
-    'kernel.msgmax=65536'
-    'kernel.=/sbin/'
-    'kernel.panic_print=0'
-    'kernel.panic_on_warn=0'
-    'kernel.panic_on_unrecovered_nmi=0'
-    'kernel.panic_on_stackoverflow=0'
-    'kernel.panic_on_rcu_stall=0'
-    'kernel.panic_on_oops=0'
-    'kernel.panic_on_io_nmi=0'
-    'kernel.printk = 3 3 3 3'
-    'kernel.unknown_nmi_panic = 0'
-    'kernel.watchdog = 1'
-    'kernel.soft_watchdog = 1'
-    'kernel.keys.maxkeys = 1000'
-    'kernel.keys.maxbytes = 20000'
-    'kernel.yama.ptrace_scope = 3'
-    'kernel.kexec_load_disabled = 1'
-    'kernel.core_pattern=\|/bin/false'
-    'kernel.core_uses_pid = 1'
-    'kernel.dmesg_restrict = 1'
-    'kernel.exec-shield = 1'
-    'kernel.exec-shield-randomize=1'
-    'kernel.sysrq = 0'
-    'kernel.randomize_va_space = 2'
-    'kernel.pid_max = 65536'
-    'kernel.nx = 1'
-    'kernel.panic = 10'
-    'kernel.kptr_restrict = 2'
-    'kernel.unprivileged_bpf_disabled = 1'
-    'kernel.unprivileged_userns_clone = 0'
-    'kernel.unprivileged_userns_apparmor_policy = 1'
-    'kernel.perf_event_paranoid=3'
-    'kernel.perf_event_max_contexts_per_stack=8'
-    'kernel.ctrl-alt-del = 0'
-    'vm.mmap_min_addr=65536'
-    'vm.unprivileged_userfaultfd=0'
-    'vm.panic_on_oom = 1'
-    'vm.swappiness=10'
-    'vm.panic_on_oom=0'
-    'vm.overcommit_memory=0'
-    'vm.oom_dump_tasks=0'
-    'vm.mmap_rnd_compat_bits=16'
-    'vm.mmap_rnd_bits=32'
-    'vm.mmap_min_addr=4096'
-    'vm.memory_failure_early_kill=0'
-    'vm.max_map_count=1048576'
-    'vm.legacy_va_layout=0'
-    'vm.oom_kill = 1'
-    'vm.panic_on_oom=0'
-    'net.core.rmem_max = 8388608'
-    'net.core.wmem_max = 8388608'
-    'net.core.netdev_max_backlog = 5000'
-    'net.core.bpf_jit_enable = 0'
-    'net.core.bpf_jit_harden = 2'
-    'net.ipv4.tcp_moderate_rcvbuf = 1'
-    'net.ipv4.tcp_reordering = 3'
-    'net.ipv4.tcp_max_orphans = 32768'
-    'net.ipv4.tcp_orphan_retries = 0'
-    'net.ipv4.tcp_rfc1337 = 1'
-    'net.ipv4.tcp_rmem = 10240 87380 12582912'
-    'net.ipv4.tcp_window_scaling = 1'
-    'net.ipv4.tcp_wmem = 10240 87380 12582912'
-    'net.ipv4.tcp_max_tw_buckets = 65536'
-    'net.ipv4.tcp_tw_reuse = 0'
-    'net.ipv4.tcp_fin_timeout = 7'
-    'net.ipv4.tcp_sack = 0'
-    'net.ipv4.tcp_dsack = 0'
-    'net.ipv4.tcp_fack = 0'
-    'net.ipv4.tcp_max_syn_backlog = 1280'
-    'net.ipv4.tcp_synack_retries = 2'
-    'net.ipv4.tcp_syncookies = 1'
-    'net.ipv4.tcp_syn_retries = 5'
-    'net.ipv4.tcp_timestamps = 1'
-    'net.ipv4.tcp_mtu_probing=1'
-    'net.ipv4.tcp_invalid_ratelimit=500'
-    'net.ipv4.tcp_keepalive_time=300'
-    'net.ipv4.tcp_keepalive_probes=5'
-    'net.ipv4.tcp_keepalive_intvl=15'
-    'net.ipv4.tcp_fastopen=3'
-    'net.ipv4.tcp_challenge_ack_limit=2147483647'
-    'net.ipv4.conf.all.shared_media=0'
-    'net.ipv4.conf.all.send_redirects=0'
-    'net.ipv4.conf.all.secure_redirects=1'
-    'net.ipv4.conf.all.rp_filter=1'
-    'net.ipv4.conf.all.route_localnet=0'
-    'net.ipv4.conf.all.proxy_arp_pvlan=0'
-    'net.ipv4.conf.all.proxy_arp=0'
-    'net.ipv4.conf.all.promote_secondaries=0'
-    'net.ipv4.conf.all.mc_forwarding=0'
-    'net.ipv4.conf.all.log_martians=1'
-    'net.ipv4.conf.all.forwarding=0'
-    'net.ipv4.conf.all.force_igmp_version=3'
-    'net.ipv4.conf.all.drop_unicast_in_l2_multicast=1'
-    'net.ipv4.conf.all.drop_gratuitous_arp=1'
-    'net.ipv4.conf.all.disable_xfrm=0'
-    'net.ipv4.conf.all.disable_policy=0'
-    'net.ipv4.conf.all.bootp_relay=0'
-    'net.ipv4.conf.all.bc_forwarding=0'
-    'net.ipv4.conf.all.arp_notify=0'
-    'net.ipv4.conf.all.arp_ignore=1'
-    'net.ipv4.conf.all.arp_filter=0'
-    'net.ipv4.conf.all.arp_announce=2'
-    'net.ipv4.conf.all.arp_accept=0'
-    'net.ipv4.conf.all.accept_source_route=0'
-    'net.ipv4.conf.all.accept_redirects=0'
-    'net.ipv4.conf.all.accept_local=0'
-    'net.ipv4.conf.default.shared_media=0'
-    'net.ipv4.conf.default.send_redirects=0'
-    'net.ipv4.conf.default.secure_redirects=1'
-    'net.ipv4.conf.default.rp_filter=1'
-    'net.ipv4.conf.default.route_localnet=0'
-    'net.ipv4.conf.default.proxy_arp_pvlan=0'
-    'net.ipv4.conf.default.proxy_arp=0'
-    'net.ipv4.conf.default.promote_secondaries=0'
-    'net.ipv4.conf.default.mc_forwarding=0'
-    'net.ipv4.conf.default.log_martians=1'
-    'net.ipv4.conf.default.forwarding=0'
-    'net.ipv4.conf.default.force_igmp_version=3'
-    'net.ipv4.conf.default.drop_unicast_in_l2_multicast=1'
-    'net.ipv4.conf.default.drop_gratuitous_arp=1 '
-    'net.ipv4.conf.default.disable_xfrm=0'
-    'net.ipv4.conf.default.disable_policy=0'
-    'net.ipv4.conf.default.bootp_relay=0'
-    'net.ipv4.conf.default.bc_forwarding=0'
-    'net.ipv4.conf.default.arp_notify=0'
-    'net.ipv4.conf.default.arp_ignore=1'
-    'net.ipv4.conf.default.arp_filter=0'
-    'net.ipv4.conf.default.arp_announce=2'
-    'net.ipv4.conf.default.arp_accept=0'
-    'net.ipv4.conf.default.accept_source_route=0'
-    'net.ipv4.conf.default.accept_redirects=0'
-    'net.ipv4.conf.default.accept_local=0'
-    'net.ipv4.icmp_echo_ignore_all = 0'
-    # BOILERSTORM/cai-db01 SAFETY: ^ ICMP/ping is a listed scored protocol - keep it = 0 (answer pings)
-    'net.ipv4.icmp_echo_ignore_broadcasts = 1'
-    'net.ipv4.icmp_ignore_bogus_error_responses = 1'
-    'net.ipv4.ip_forward = 0'
-    'net.ipv4.ip_local_port_range = 2000 65000'
-    'net.ipv4.ipfrag_max_dist=64'
-    'net.ipv4.ip_no_pmtu_disc=0'
-    'net.ipv4.ip_dynaddr=1'
-    'net.ipv4.fib_multipath_hash_policy=1'
-    'net.ipv6.conf.default.use_tempaddr=2'
-    'net.ipv6.conf.default.disable_ipv6 = 1'
-    'net.ipv6.conf.default.router_solicitations = 0'
-    'net.ipv6.conf.default.accept_ra_rtr_pref = 0'
-    'net.ipv6.conf.default.accept_ra_pinfo = 0'
-    'net.ipv6.conf.default.accept_ra_defrtr = 0'
-    'net.ipv6.conf.default.accept_ra = 0'
-    'net.ipv6.conf.default.autoconf = 0'
-    'net.ipv6.conf.default.dad_transmits = 0'
-    'net.ipv6.conf.default.max_addresses = 1'
-    'net.ipv6.conf.default.forwarding=0'
-    'net.ipv6.conf.default.accept_source_route=0'
-    'net.ipv6.conf.default.accept_redirects=0'
-    'net.ipv6.conf.all.use_tempaddr=2'
-    'net.ipv6.conf.all.max_addresses=1'
-    'net.ipv6.conf.all.forwarding=0'
-    'net.ipv6.conf.all.disable_ipv6=1'
-    'net.ipv6.conf.all.dad_transmits=0'
-    'net.ipv6.conf.all.autoconf=0'
-    'net.ipv6.conf.all.accept_source_route=0'
-    'net.ipv6.conf.all.accept_redirects=0'
-    'net.ipv6.conf.all.accept_ra_rtr_pref=0'
-    'net.ipv6.conf.all.accept_ra_pinfo=0'
-    'net.ipv6.conf.all.accept_ra_defrtr=0'
-    'net.ipv6.conf.all.accept_ra=0'
-    'abi.vsyscall32=0'
-    'crypto.fips_enabled=1'
-    'dev.tty.ldisc_autoload=0'
-    'dev.tty.legacy_tiocsti=0'
-    'user.max_user_namespaces=0'
-    )
-
-    # Iterate through each configuration and modify the file
-    for config in "${configurations[@]}"; do
-    regex="^([^=[:space:]]+)"
-    [[ $config =~ $regex ]]
-    captured="${BASH_REMATCH[1]}"
-    if grep -q "$captured" config_file; then
-        sed -i "/$captured/c${config}" "$config_file"
-    else
-        echo "${config}" | sudo tee -a "$config_file"
-    fi
-    done
-
-    # Change file to ufw
-    config_file="/etc/ufw/sysctl.conf"
-    # Iterate through each configuration and modify the file
-    for config in "${configurations[@]}"; do
-    regex="^([^=[:space:]]+)"
-    [[ $config =~ $regex ]]
-    captured="${BASH_REMATCH[1]}"
-    if grep -q "$captured" config_file; then
-        sed -i "/$captured/c${config}" "$config_file"
-    else
-        echo "${config}" | sudo tee -a "$config_file"
-    fi
-    done
-    # Turns on lockdown
-    # BOILERSTORM/cai-db01 SAFETY: kernel lockdown=confidentiality is irreversible without a
-    # reboot and can block legitimate DB/kernel operations; leave it off during the event.
-    # echo "none integrity [confidentiality]" | sudo tee /sys/kernel/security/lockdown
-
-    echo "Kernel has been hardened"
-    sysctl -p
-    echo "#" > /etc/init/control-alt-delete.conf
-    systemctl disable ctrl-alt-del.target
-    systemctl mask ctrl-alt-del.target
-    echo "Ctrl Alt Del disabled"
-    }
-
-    networkConfig (){
-    # BOILERSTORM/cai-db01 SAFETY: internal DNS is the domain controller (CAI-DC01,
-    # 10.42.0.10). Pointing at 8.8.8.8 breaks resolution of closedai.com and can break the
-    # app. DNSSEC dropped because internal AD DNS may not serve it.
-    echo -e "nameserver 10.42.0.10\noptions edns0\noptions timeout:5\noptions attempts:3\noptions rotate" | sudo tee /etc/resolv.conf
-
-    echo "127.0.0.1	localhost" > /etc/hosts
-    echo "127.0.1.1	$(hostname)" >> /etc/hosts   # BOILERSTORM: use the box's REAL current hostname; never hardcode/rename
-    echo "::1     ip6-localhost ip6-loopback" >> /etc/hosts
-    echo "fe00::0 ip6-localnet" >> /etc/hosts
-    echo "ff00::0 ip6-mcastprefix" >> /etc/hosts
-    echo "ff02::1 ip6-allnodes" >> /etc/hosts
-    echo "ff02::2 ip6-allrouters" >> /etc/hosts
-    # BOILERSTORM/cai-db01 SAFETY: do NOT blanket-deny via tcpwrappers; "ALL: ALL" in
-    # hosts.deny can drop SSH and other scored connections. Left unset.
-    # echo "ALL: ALL" > /etc/hosts.deny
-
-    # Think deprecated
-    # echo -e "order bind,host\nmulti off\nnospoof on" > /etc/host.conf
-    echo "IP spoofing prevention configuration completed."
-    }
-
-    systemdConfig (){
-        # Logind Configuration
-        echo -e '[Login]\nUserTasksMax=33%\nKillUserProcesses=yes\nKillOnlyUser=\nKillExcludeUsers=root\nSystemCallFilter=@cpu-emulation @debug\nIdleAction=lock\nIdleActionSec=5min\nRuntimeDirectoryPreserve=no\nRemoveIPC=yes\nAllowNAutoVTs=0' | sudo tee /etc/systemd/logind.conf
-
-        # System Configuration
-        echo -e "[Manager]\nLogLevel=debug\nLogTarget=journal-or-kmsg\nLogColor=yes\nLogLocation=yes\nLogTime=yes\nShowStatus=error\nDumpCore=no\nShowStatus=yes\nCrashChangeVT=yes\nCrashShell=no\nCrashReboot=no\nCtrlAltDelBurstAction=none\nCPUAffinity=1 2\nNUMAPolicy=local\nSystemCallArchitectures=native\nDumpCore=no\nCrashShell=no\nDefaultLimitCORE=0\nDefaultLimitNOFILE=1024" | sudo tee /etc/systemd/system.conf
-
-        # OOM configuration
-        echo -e '[OOM]\nSwapUsedLimit=10%\nDefaultMemoryPressureLimit=10%\nDefaultMemoryPressureDurationSec=30' | sudo tee /etc/systemd/oomd.conf
-
-        # Resolved config 
-        # BOILERSTORM/cai-db01 SAFETY: use internal DNS (CAI-DC01 10.42.0.10); DoT/DNSSEC off
-        # because internal AD DNS will not serve them and resolution would fail.
-        echo -e '[Resolve]\nDNS=10.42.0.10\nDNSOverTLS=no\nFallbackDNS=\nDNSSEC=no\nLLMNR=no\nMulticastDNS=no\nCache=yes' | sudo tee /etc/systemd/resolved.conf
-
-        # Journald config
-        echo -e "[Journal]\nForwardToSyslog=yes\nCompress=yes\nStorage=persistent\nAudit=yes\nSeal=yes\nSplitMode=uid" | sudo tee /etc/systemd/journald.conf
-
-        # User config
-        echo -e "[Manager]\nLogLevel=debug" | sudo tee /etc/systemd/user.conf
-
-        # Pstore config
-        echo -e "[PStore]\nUnlink=1" | sudo tee /etc/systemd/pstore.conf
-
-        # CoreDumo config 
-        echo -e "[Coredump]\nStorage=none\nProcessSizeMax=0" | sudo tee /etc/systemd/coredump.conf
-
-        # logind hidepid
-        mkdir -p /etc/systemd/system/systemd-logind.service.d
-        echo -e "[Service]\nSupplementaryGroups=proc" > /etc/systemd/system/systemd-logind.service.d/hidepid.conf
-
-        # limits config
-        echo -e "*\tsoft\tcore\t0\n*\thard\tcore\t0\n\n*\tsoft\tdata\tunlimited\n*\thard\tdata\tunlimited\n\n*\tsoft\tfsize\t3000000\n*\thard\tfsize\t4000000\n\n*\tsoft\tmemlock\t256000\n*\thard\tmemlock\t512000\n\n*\tsoft\trss\t809600\n*\thard\trss\t1619200\n\n*\tsoft\tstack\t8192\n*\thard\tstack\t40960\n\n*\tsoft\tcpu\t1800\n*\thard\tcpu\t3600\n\n*\tsoft\tnproc\t1024\n*\thard\tnproc\t2048\n\n*\tsoft\tas\t256000\n*\thard\tas\t512000\n\n0:1000 hard maxlogins 0\n1000: hard maxlogins 1\n\n*\tsoft\tmaxsyslogins\t5\n*\thard\tmaxsyslogins\t10\n\n*\tsoft\tpriority\t0\n*\thard\tpriority\t0\n\n*\tsoft\tlocks\t256\n*\thard\tlocks\t512\n\n*\tsoft\tsigpending\t8192\n*\thard\tsigpending\t8192\n\n*\tsoft\tmsgqueue\t819200\n*\thard\tmsgqueue\t819200\n\n*\tsoft\tnice\t0\n*\thard\tnice\t0\n\n*\tsoft\trtprio\t0\n*\thard\trtprio\t0\n\n*\thard\tinotify\t1024\n*\tsoft\tinotify\t512\n\n*\tsoft\tnofile\t512\n*\thard\tnofile\t1024" | sudo tee /etc/security/limits.conf
-    }
-
-    securityTools (){
-    # Install security tools
-    apt purge ufw
-    apt install -y clamav chkrootkit rkhunter apparmor debian-goodies rfkill ufw
-    # UFW configuration
-    ufw reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    # BOILERSTORM/cai-db01 SAFETY: open SSH and the DB ports BEFORE enabling, or the
-    # "deny incoming" default black-holes the scored database and your own SSH access.
-    ufw allow 22/tcp         # SSH (your access; may also be scored)
-    ufw allow 5432/tcp       # PostgreSQL (scored DB)
-    ufw allow 3306/tcp       # MySQL/MariaDB (scored DB)
-    ufw allow http
-    ufw allow https
-    ufw logging on
-    ufw logging full
-    ufw enable
-    ufw status
-    systemctl enable ufw
-
-    echo -e "IPV6=no\nDEFAULT_INPUT_POLICY=\"DROP\"\nDEFAULT_OUTPUT_POLICY=\"ACCEPT\"\nDEFAULT_FORWARD_POLICY=\"DROP\"\nDEFAULT_APPLICATION_POLICY=\"SKIP\"\nMANAGE_BUILTINS=no\nIPT_SYSCTL=/etc/sysctl.conf\nIPT_MODULES=\"\"" | sudo tee /etc/default/ufw
-
-    ufw status verbose
-
-    echo "Firewall enabled."
-    rfkill block all
-    echo "Installed security tools"
-    # Enable rsyslog
-    systemctl enable rsyslog
-    systemctl start rsyslog
-    # Sets secure permissions on all log files
-    find /var/log -type f -exec chmod g-wx,o-rwx "{}" + -o -type d -exec chmod g-wx,o-rwx "{}" +
-    # Update ClamAV definitions
-    freshclam
-    # Run chkrootkit
-    chkrootkit -q 
-    # Update and run rkhunter
-    # rkhunter --update
-    # rkhunter --propupd
-    # rkhunter -c --enable all --disable none
-    
-    # clamscan -ir 
-    
-    aa-enforce /etc/apparmor.d/*
-    systemctl enable apparmor
-    systemctl start apparmor
-    systemctl start journald
-    systemctl enable journald
-    
-
-    checkrestart
-    which-pkg-broke
-
-    systemctl enable apt-daily-upgrade.timer
-    systemctl start apt-daily-upgrade.timer
-
-    systemctl enable apt-daily.timer
-    systemctl start apt-daily.timer
-
-    systemctl enable update-notifier-motd.timer
-    systemctl start update-notifier-motd.timer
-
-    systemctl enable update-notifier-download.timer
-    systemctl start update-notifier-download.timer
-
-    # echo "Set MONITOR_ALL yes/nSet LOGFILE syslog" > /etc/samhain/samhainrc
-
-    echo "Ran security tools"
-
-    # Configure Auditd
-    apt-get install -y auditd git
-
-    # Enable Auditd
-    auditctl -e 1
-
-    # Configure /etc/audit/auditd.conf
-    # Define the auditd configuration file path
-    config_file="/etc/audit/auditd.conf"
-
-    # Define an array of configurations to modify
-    configurations=(
-    'write_logs = yes'
-    'log_file = /var/log/audit/audit.log'
-    'max_log_file = 100000000000'
-    'log_file_mode = 0640'
-    'space_left = 100'
-    'space_left_action = email'
-    'action_mail_acct = root'
-    'admin_space_left_action = halt'
-    'max_log_file_action = keep_logs'
-    'local_events = yes'
-    )
-
-    # Iterate through each configuration and modify the file
-    for config in "${configurations[@]}"; do
-    regex="^([^=[:space:]]+)"
-    [[ $config =~ $regex ]]
-    captured="${BASH_REMATCH[1]}"
-    if grep -q "$captured" config_file; then
-        sed -i "/$captured/c${config}" "$config_file"
-    else
-        echo "${config}" | sudo tee -a "$config_file"
-    fi
-    done
-
-    # Restart Auditd
-    systemctl enable auditd
-
-    # Install Lynis
-    cd /usr/local
-    git clone https://github.com/CISOfy/lynis
-    chown -R 0:0 /usr/local/lynis
-
-    # Audit the system with Lynis
-    cd /usr/local/lynis
-    git pull
-    ./lynis audit system
-
-    echo "Scanning completed."
-
-    # Look through /var/log/lynis-report.dat for warnings and suggestions
-    grep -E 'warning|suggestion' /var/log/lynis-report.dat | sed -e 's/warning\[\]\=//g' | sed -e 's/suggestion\[\]\=//g'
-    }
-
-
-    malwareHunt (){
-    # Root directory to start searching from
-    SEARCH_DIR="/"
-
-    # Directories to skip (system-critical directories that should not be altered)
-    EXCLUDE_DIRS=(
-        "/proc"
-        "/dev"
-        "/run"
-        "/mnt"
-        "/media"
-        "/sys/module"
-        "/boot"
-        "/var/lib"
-    )
-
-    # Log file for tracking deletions
-    LOG_FILE="/var/log/malware_hunt.log"
-
-    # Function to safely remove suspicious files or directories with confirmation
-    remove_suspicious_files() {
-        local dir=$1
-
-        for exclude in "${EXCLUDE_DIRS[@]}"; do
-            if [[ "$dir" == "$exclude"* ]]; then
-                return 0  # Skip this directory
-            fi
-        done
-
-        echo "Scanning directory: $dir"
-
-        # Patterns to detect suspicious files or directories
-        declare -A patterns=(
-            ["."]="Suspicious hidden directory"
-            [".."]="Directory traversal pattern"
-            ["./*"]="Suspicious prefix"
-            ["*[^[:print:]]*"]="Non-printable characters"
-        )
-
-        for pattern in "${!patterns[@]}"; do
-            find "$dir" -mindepth 1 -name "$pattern" 2>/dev/null | while read -r file; do
-                echo "[!] ${patterns[$pattern]} found: $file"
-                read -p "Do you want to delete it? (y/n): " answer
-                if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
-                    rm -rf "$file"
-                    echo "Deleted: $file" | tee -a "$LOG_FILE"
-                else
-                    echo "Skipped: $file"
-                fi
-            done
-        done
-    }
-
-    # Scan the system for suspicious files
-    remove_suspicious_files "$SEARCH_DIR"
-
-    # Additional checks
-    echo "[+] Searching for potentially suspicious files and patterns..."
-
-    # Detect "hehe" pattern in filenames
-    find / -iname "*hehe*" 2>/dev/null
-
-    # Check for hidden processes
-    unhide-posix proc
-
-    # Scan for suspicious network activity (e.g., netcat)
-    sudo lsof -i -n | grep -E 'nc|netcat'
-
-    # Check for OpenSSL abuse
-    echo "Potentially suspicious OpenSSL processes:"
-    ps aux | grep openssl | grep -v grep
-
-    # Function to search for personally identifiable information (PII)
-    search_for_pii() {
-        local dir=$1
-        echo "[+] Searching $dir for PII..."
-
-        grep -arE "(\([0-9]{3}\) |[0-9]{3}-)[0-9]{3}-[0-9]{4}" "$dir" 2>/dev/null
-        grep -arE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(com|org|net|edu|gov)' "$dir" 2>/dev/null
-        grep -arE '[0-9]{3}-[0-9]{2}-[0-9]{4}' "$dir" 2>/dev/null
-    }
-
-    # Search common directories for PII
-    search_for_pii "/home"
-    search_for_pii "/var/www"
-
-    # Check FTP configurations for potential PII exposure
-    check_ftp_configs() {
-        local config_file=$1
-        local pattern=$2
-
-        if [ -f "$config_file" ]; then
-            echo "[+] Found $config_file. Checking for exposed directories..."
-            local paths=$(grep -E "^$pattern" "$config_file" | awk '{print $2}')
-            
-            for path in $paths; do
-                if [ -d "$path" ]; then
-                    echo "[+] Checking $path for PII..."
-                    search_for_pii "$path"
-                fi
-            done
-        fi
-    }
-
-    check_ftp_configs "/etc/vsftpd.conf" "anon_root"
-    check_ftp_configs "/etc/vsftpd.conf" "local_root"
-    check_ftp_configs "/etc/proftpd/proftpd.conf" "DefaultRoot"
-
-    # Check Samba shares for PII
-    if [ -f /etc/samba/smb.conf ]; then
-        echo "[+] Samba config found. Checking for shared paths..."
-        shares=$(grep -E '^\s*path\s*=' /etc/samba/smb.conf | awk -F= '{print $2}' | sed 's/"//g' | xargs)
-        
-        for share in $shares; do
-            if [ -d "$share" ]; then
-                read -p "Check $share for PII? (y/n): " skip
-                if [[ "$skip" != "y" ]]; then
-                    search_for_pii "$share"
-                fi
-            fi
-        done
-    fi
-
-    # Capabilities check for privilege escalation
-    echo "[+] Checking for files with unusual capabilities..."
-    for dir in "/usr/bin" "/usr/sbin"; do
-        find "$dir" -type f -exec getcap {} + 2>/dev/null | grep -v "no capabilities set"
-    done
-
-    # Pause for manual review
-    echo -n "Press any key to continue..."
-    read -n 1 -s
-
-    # Network review
-    echo "Network connections overview:"
-    lsof -i -n -P | grep -v "LISTEN"
-
-    echo "[+] Malware detection script completed."
-    }
-
-    packagesAndServices (){
-    sudo apt-mark unhold $(apt-mark showhold)
-    sudo apt-get purge -y 0ad 0ad-data 0ad-data-common 2048-qt 3dchess 4digits 7kaa 7kaa-data a7xpg a7xpg-data aajm abe abe-data ace-of-penguins acm adanaxisgpl adanaxisgpl-data adonthell adonthell-data airstrike airstrike-common aisleriot alex4 alex4-data alien-arena alien-arena-data alien-arena-server alienblaster alienblaster-data allure amoebax amoebax-data amphetamine amphetamine-data an anagramarama anagramarama-data angband angband-audio angband-data angrydd animals antigravitaattori ardentryst armagetronad armagetronad-common armagetronad-dedicated asc asc-data asc-music asciijump assaultcube assaultcube-data astromenace astromenace-data-src asylum asylum-data atanks atanks-data atom4 atomix atomix-data attal attal-themes-medieval auralquiz balder2d balder2d-data ballerburg ballz ballz-data ballz-dbg bambam barrage bastet bb bear-factory beneath-a-steel-sky berusky berusky-data berusky2 berusky2-data between billard-gl billard-gl-data biloba biloba-data biniax2 biniax2-data black-box blobandconquer blobandconquer-data blobby blobby-data blobby-server bloboats blobwars blobwars-data blockattack blockout2 blocks-of-the-undead blocks-of-the-undead-data bombardier bomber bomberclone bomberclone-data boswars boswars-data bouncy bovo brainparty brainparty-data briquolo briquolo-data brutalchess bsdgames bsdgames-nonfree btanks btanks-data bubbros bucklespring bucklespring-data bugsquish bumprace bumprace-data burgerspace bve-route-cross-city-south bve-train-br-class-323 bve-train-br-class-323-3dcab bygfoot bygfoot-data bzflag bzflag-client bzflag-data bzflag-server cappuccino caveexpress caveexpress-data cavepacker cavepacker-data cavezofphear ceferino ceferino-data cgoban chessx childsplay childsplay-alphabet-sounds-bg childsplay-alphabet-sounds-ca childsplay-alphabet-sounds-de childsplay-alphabet-sounds-el childsplay-alphabet-sounds-en-gb childsplay-alphabet-sounds-es childsplay-alphabet-sounds-fr childsplay-alphabet-sounds-it childsplay-alphabet-sounds-nb childsplay-alphabet-sounds-nl childsplay-alphabet-sounds-pt childsplay-alphabet-sounds-ro childsplay-alphabet-sounds-ru childsplay-alphabet-sounds-sl childsplay-alphabet-sounds-sv chipw chocolate-common chocolate-doom chromium-bsu chromium-bsu-data circuslinux circuslinux-data colobot colobot-common colobot-common-sounds colobot-common-textures colorcode colossal-cave-adventure connectagram connectagram-data cookietool corsix-th corsix-th-data cowsay cowsay-off crack-attack crafty crafty-bitmaps crafty-books-medium crafty-books-medtosmall crafty-books-small crawl crawl-common crawl-tiles crawl-tiles-data crimson criticalmass criticalmass-data crossfire-client crossfire-client-images crossfire-client-sounds crossfire-common crossfire-maps crossfire-maps crossfire-maps-small crossfire-server crrcsim crrcsim-data csmash csmash-data csmash-demosong cube2 cube2-data cube2-server cultivation curseofwar cutemaze cuyo cuyo-data cyphesis-cpp cyphesis-cpp-clients cyphesis-cpp-mason cytadela cytadela-data d1x-rebirth d2x-rebirth dangen darkplaces darkplaces-server ddnet ddnet-data ddnet-server ddnet-tools dds deal dealer defendguin defendguin-data desmume deutex dhewm3 dhewm3-d3xp dhewm3-doom3 dizzy dodgindiamond2 dolphin-emu dolphin-emu-data doom-wad-shareware doomsday doomsday-common doomsday-data doomsday-server dopewars dopewars-data dossizola dossizola-data drascula drascula-french drascula-german drascula-italian drascula-music drascula-spanish dreamchess dreamchess-data dustracing2d dustracing2d-data dvorak7min dwarf-fortress dwarf-fortress-data eboard eboard-extras-pack1 edgar edgar-data efp einstein el-ixir ember ember-media empire empire-hub empire-lafe endless-sky endless-sky-data endless-sky-high-dpi enemylines3 enemylines7 enigma enigma-data epiphany epiphany-data etoys etqw etqw-server etw etw-data excellent-bifurcation extremetuxracer extremetuxracer-data exult exult-studio ezquake fairymax fb-music-high ffrenzy fgo fgrun fheroes2-pkg filler fillets-ng fillets-ng-data fillets-ng-data-cs fillets-ng-data-nl filters five-or-more fizmo-common fizmo-console fizmo-ncursesw fizmo-sdl2 flare flare-data flare-engine flare-game flight-of-the-amazon-queen flightgear flightgear-data-ai flightgear-data-all flightgear-data-base flightgear-data-models flightgear-phi flobopuyo fltk1.1-games fltk1.3-games foobillardplus foobillardplus-data fortunate.app fortune-anarchism fortune-mod fortune-zh fortunes fortunes-bg fortunes-bofh-excuses fortunes-br fortunes-cs fortunes-de fortunes-debian-hints fortunes-eo fortunes-eo-ascii fortunes-eo-iso3 fortunes-es fortunes-es-off fortunes-fr fortunes-ga fortunes-it fortunes-it-off fortunes-mario fortunes-min fortunes-off fortunes-pl fortunes-ru fortunes-spam fortunes-zh four-in-a-row freealchemist freecell-solver-bin freeciv freeciv-client-extras freeciv-client-gtk freeciv-client-gtk3 freeciv-client-qt freeciv-client-sdl freeciv-data freeciv-server freeciv-sound-standard freecol freedink freedink-data freedink-dfarc freedink-dfarc-dbg freedink-engine freedink-engine-dbg freedm freedoom freedroid freedroid-data freedroidrpg freedroidrpg-data freegish freegish-data freeorion freeorion-data freespace2 freespace2-launcher-wxlauncher freesweep freetennis freetennis-common freevial fretsonfire fretsonfire-game fretsonfire-songs-muldjord fretsonfire-songs-sectoid frogatto frogatto-data frotz frozen-bubble frozen-bubble-data fruit funguloids funguloids-data funnyboat gamazons game-data-packager game-data-packager-runtime gameclock gamine gamine-data garden-of-coloured-lights garden-of-coloured-lights-data gargoyle-free gav gav-themes gbrainy gcompris gearhead gearhead-data gearhead-sdl gearhead2 gearhead2-data gearhead2-sdl geekcode geki2 geki3 gemdropx gemrb gemrb-baldurs-gate gemrb-baldurs-gate-2 gemrb-baldurs-gate-2-data gemrb-baldurs-gate-data gemrb-data gemrb-icewind-dale gemrb-icewind-dale-2 gemrb-icewind-dale-2-data gemrb-icewind-dale-data gemrb-planescape-torment gemrb-planescape-torment-data geneatd gfceu gfpoken gl-117 gl-117-data glaurung glhack glob2 glob2-data glpeces glpeces-data gltron gmchess gmult gnome-2048 gnome-breakout gnome-cards-data gnome-chess gnome-games-app gnome-klotski gnome-mahjongg gnome-mastermind gnome-mines gnome-nibbles gnome-robots gnome-sudoku gnome-tetravex gnubg gnubg-data gnubik gnuboy-sdl gnuboy-x gnuchess gnuchess-book gnudoq gnugo gnujump gnujump-data gnuminishogi gnurobbo gnurobbo-data gnushogi golly gomoku.app gplanarity gpsshogi gpsshogi-data granatier granule gravitation gravitywars greed grhino grhino-data gridlock.app groundhog gsalliere gtans gtkballs gtkboard gtkpool gunroar gunroar-data gweled hachu hannah hannah-data hearse hedgewars hedgewars-data heroes heroes-data heroes-sound-effects heroes-sound-tracks hex-a-hop hex-a-hop-data hexalate hexxagon higan hitori hoichess holdingnuts holdingnuts-server holotz-castle holotz-castle-data holotz-castle-editor hyperrogue hyperrogue-music iagno icebreaker ii-esu infon-server infon-viewer instead instead-data ioquake3 ioquake3-server jag jag-data jester jigzo jigzo-data jmdlx jumpnbump jumpnbump-levels jzip kajongg kanagram kanatest kapman katomic kawari8 kball kball-data kblackbox kblocks kbounce kbreakout kcheckers kdegames-card-data kdegames-card-data-kf5 kdegames-mahjongg-data-kf5 kdiamond ketm ketm-data kfourinline kgoldrunner khangman kigo kiki-the-nano-bot kiki-the-nano-bot-data kildclient killbots kiriki kjumpingcube klickety klines kmahjongg kmines knavalbattle knetwalk knights kobodeluxe kobodeluxe-data kolf kollision komi konquest koules kpat krank kraptor kraptor-data kreversi kshisen ksirk ksnakeduel kspaceduel ksquares ksudoku ktuberling kubrick laby lambdahack late late-data lbreakout2 lbreakout2-data lgc-pg lgeneral lgeneral-data libatlas-cpp-0.6-tools libgemrb libmgba libretro-beetle-pce-fast libretro-beetle-psx libretro-beetle-vb libretro-beetle-wswan libretro-bsnes-mercury-accuracy libretro-bsnes-mercury-balanced libretro-bsnes-mercury-performance libretro-desmume libretro-gambatte libretro-genesisplusgx libretro-mgba libretro-mupen64plus libretro-nestopia libretro-snes9x lierolibre lierolibre-data lightsoff lightyears lincity lincity-ng lincity-ng-data liquidwar liquidwar-data liquidwar-server littlewizard littlewizard-data lmarbles lmemory lolcat londonlaw lordsawar lordsawar-data love lskat ltris lugaru lugaru-data luola luola-data luola-levels luola-nostalgy lure-of-the-temptress macopix-gtk2 madbomber madbomber-data maelstrom magicmaze magicor magicor-data magictouch mah-jong mame mame-data mame-extra manaplus manaplus-data mancala marsshooter marsshooter-data matanza mazeofgalious mazeofgalious-data mednafen mednaffe megaglest megaglest-data meritous meritous-data mgba-common mgba-qt mgba-sdl mgt miceamaze micropolis micropolis-data minetest minetest-data minetest-mod-advspawning minetest-mod-animalmaterials minetest-mod-animals minetest-mod-character-creator minetest-mod-craftguide minetest-mod-homedecor minetest-mod-maidroid minetest-mod-mesecons minetest-mod-mobf minetest-mod-mobf-core minetest-mod-mobf-trap minetest-mod-moreblocks minetest-mod-moreores minetest-mod-nether minetest-mod-pipeworks minetest-mod-player-3d-armor minetest-mod-quartz minetest-mod-torches minetest-mod-unifieddyes minetest-mod-worldedit minetest-server mirrormagic mirrormagic-data mokomaze monopd monsterz monsterz-data moon-buggy moon-lander moon-lander-data moria morris mousetrap mrboom mrrescue mttroff mu-cade mu-cade-data mudlet multitet mupen64plus-audio-all mupen64plus-audio-sdl mupen64plus-data mupen64plus-input-all mupen64plus-input-sdl mupen64plus-qt mupen64plus-rsp-all mupen64plus-rsp-hle mupen64plus-rsp-z64 mupen64plus-ui-console mupen64plus-video-all mupen64plus-video-arachnoid mupen64plus-video-glide64 mupen64plus-video-glide64mk2 mupen64plus-video-rice mupen64plus-video-z64 nestopia nethack-common nethack-console nethack-el nethack-lisp nethack-x11 netmaze netpanzer netpanzer-data netris nettoe neverball neverball-common neverball-data neverputt neverputt-data nexuiz nexuiz-data nexuiz-music nexuiz-server nexuiz-textures nikwi nikwi-data ninix-aya ninvaders njam njam-data noiz2sa noiz2sa-data nsnake nudoku numptyphysics ogamesim ogamesim-www omega-rpg oneisenough oneko onscripter open-adventure open-invaders open-invaders-data openarena openarena-081-maps openarena-081-misc openarena-081-players openarena-081-players-mature openarena-081-textures openarena-085-data openarena-088-data openarena-data openarena-oacmp1 openarena-server openbve-data opencity opencity-data openclonk openclonk-data openlugaru openlugaru-data openmw openmw-cs openmw-data openmw-launcher openpref openssn openssn-data openttd openttd-data openttd-opengfx openttd-openmsx openttd-opensfx opentyrian openyahtzee orbital-eunuchs-sniper orbital-eunuchs-sniper-data osmose-emulator out-of-order overgod overgod-data pachi pachi-data pacman pacman4console palapeli palapeli-data pangzero parsec47 parsec47-data passage pathogen pathological pax-britannica pax-britannica-data pcsx2 pcsxr peg-e peg-solitaire pegsolitaire penguin-command pente pentobi performous performous-tools pescetti petris pgn-extract phalanx phlipple phlipple-data pianobooster picmi pinball pinball-data pinball-dev pingus pingus-data pink-pony pink-pony-data pioneers pioneers-console pioneers-console-data pioneers-data pioneers-metaserver pipenightdreams pipenightdreams-data pipewalker piu-piu pixbros pixfrogger planarity planetblupi planetblupi-common planetblupi-music-midi planetblupi-music-ogg plee-the-bear plee-the-bear-data pokemmo-installer pokerth pokerth-data pokerth-server polygen polygen-data polyglot pong2 powder powermanga powermanga-data pq prboom-plus prboom-plus-game-server primrose projectl purity purity-ng purity-off pybik pybik-bin pybridge pybridge-common pybridge-server pykaraoke pykaraoke-bin pynagram pyracerz pyscrabble pyscrabble-common pyscrabble-server pysiogame pysolfc pysolfc-cardsets pysycache pysycache-buttons-beerabbit pysycache-buttons-crapaud pysycache-buttons-ice pysycache-buttons-wolf pysycache-click-dinosaurs pysycache-click-sea pysycache-dblclick-appleandpear pysycache-dblclick-butterfly pysycache-i18n pysycache-images pysycache-move-animals pysycache-move-food pysycache-move-plants pysycache-move-sky pysycache-move-sports pysycache-puzzle-cartoons pysycache-puzzle-photos pysycache-sounds python-pykaraoke python-renpy qgo qonk qstat qtads quadrapassel quake quake-server quake2 quake2-server quake3 quake3-data quake3-server quake4 quake4-server quakespasm quarry qxw rafkill rafkill-data raincat raincat-data randtype rbdoom3bfg redeclipse redeclipse-common redeclipse-data redeclipse-server reminiscence renpy renpy-demo renpy-thequestion residualvm residualvm-data ri-li ri-li-data ricochet rlvm robocode robotfindskitten rockdodger rocksndiamonds rolldice rott rrootage rrootage-data rtcw rtcw-common rtcw-server runescape salliere sandboxgamemaker sauerbraten sauerbraten-server scid scid-data scid-rating-data scid-spell-data scorched3d scorched3d-data scottfree scummvm scummvm-data scummvm-tools sdl-ball sdl-ball-data seahorse-adventures searchandrescue searchandrescue-common searchandrescue-data sgt-launcher sgt-puzzles shogivar shogivar-data simutrans simutrans-data simutrans-makeobj simutrans-pak128.britain simutrans-pak64 singularity singularity-music sjaakii sjeng sl slashem slashem-common slashem-gtk slashem-sdl slashem-x11 slimevolley slimevolley-data slingshot sludge-engine sm snake4 snowballz solarwolf sopwith spacearyarya spacezero speedpad spellcast sponc spout spring spring-common spring-javaai spring-maps-kernelpanic spring-mods-kernelpanic springlobby starfighter starfighter-data starvoyager starvoyager-data stax steam steam-devices steam-installer steamcmd stockfish stormbaancoureur stormbaancoureur-data sudoku supertransball2 supertransball2-data supertux supertux-data supertuxkart supertuxkart-data swell-foop tagua tagua-data tali tanglet tanglet-data tatan tdfsb tecnoballz tecnoballz-data teeworlds teeworlds-data teeworlds-server tenace tenmado tennix tetrinet-client tetrinet-server tetrinetx tetzle tf tf5 tictactoe-ng tint tintin++ tinymux titanion titanion-data toga2 tomatoes tomatoes-data tome toppler torcs torcs-data torus-trooper torus-trooper-data tourney-manager trackballs trackballs-data transcend treil trigger-rally trigger-rally-data triplane triplea trophy trophy-data trophy-dbg tumiki-fighters tumiki-fighters-data tuxfootball tuxmath tuxmath-data tuxpuck tuxtype tuxtype-data tworld tworld-data typespeed uci2wb ufoai ufoai-common ufoai-data ufoai-maps ufoai-misc ufoai-music ufoai-server ufoai-sound ufoai-textures uhexen2 uhexen2-common uligo unknown-horizons uqm uqm-content uqm-music uqm-russian uqm-voice val-and-rick val-and-rick-data vbaexpress vcmi vectoroids viruskiller visualboyadvance vodovod vor warmux warmux-data warmux-servers warzone2100 warzone2100-data warzone2100-music werewolf wesnoth wesnoth-1.12 wesnoth-1.12-aoi wesnoth-1.12-core wesnoth-1.12-data wesnoth-1.12-did wesnoth-1.12-dm wesnoth-1.12-dw wesnoth-1.12-ei wesnoth-1.12-httt wesnoth-1.12-l wesnoth-1.12-low wesnoth-1.12-music wesnoth-1.12-nr wesnoth-1.12-server wesnoth-1.12-sof wesnoth-1.12-sotbe wesnoth-1.12-thot wesnoth-1.12-tools wesnoth-1.12-trow wesnoth-1.12-tsg wesnoth-1.12-ttb wesnoth-1.12-utbs wesnoth-core wesnoth-music wfut whichwayisup widelands widelands-data wing wing-data wizznic wizznic-data wmpuzzle wolf4sdl wordplay wordwarvi wordwarvi-sound xabacus xabacus xball xbill xblast-tnt xblast-tnt-images xblast-tnt-levels xblast-tnt-models xblast-tnt-musics xblast-tnt-sounds xboard xbomb xbubble xbubble-data xchain xcowsay xdemineur xdesktopwaves xevil xfireworks xfishtank xflip xfrisk xgalaga xgalaga++ xgammon xinv3d xjig xjokes xjump xletters xmabacus xmahjongg xmille xmoto xmoto-data xmountains xmpuzzles xonix xpat2 xpenguins xphoon xpilot-extra xpilot-ng xpilot-ng-client-sdl xpilot-ng-client-x11 xpilot-ng-common xpilot-ng-server xpilot-ng-utils xpuzzles xqf xracer xracer-tools xscavenger xscorch xscreensaver-screensaver-dizzy xshisen xshogi xskat xsok xsol xsoldier xstarfish xsystem35 xteddy xtron xvier xwelltris xye xye-data xzip yahtzeesharp yamagi-quake2 yamagi-quake2-core zangband zangband-data zatacka zaz zaz-data zec zivot zoom-player gameconqueror
-    sudo apt-get purge -y acfax aldo ampr-ripd antennavis aprsdigi aprx ax25-apps ax25-tools ax25-xtools ax25mail-utils axmail baycomepp baycomusb chirp comptext comptty cqrlog cubicsdr cutesdr cw cwcp cwdaemon d-rats dablin direwolf ebook2cw ebook2cwgui fbb fccexam flamp fldigi flmsg flrig flwrap freedv glfer gnss-sdr gnuais gnuaisgui gpredict gqrx-sdr grig gsmc hamexam hamfax icom inspectrum klog libecholib1.3 libfap6 libhamlib-utils limesuite linpac linpsk lysdr morse morse-x morse2ascii multimon nec2c owx p10cfgd predict predict-gsat psk31lx pydxcluster pyqso qrq qsstv qtel qtel-icons quisk remotetrx soapyosmo-common0.6 soapyremote-server soapysdr-module-airspy soapysdr-module-all soapysdr-module-audio soapysdr-module-bladerf soapysdr-module-hackrf soapysdr-module-lms7 soapysdr-module-mirisdr soapysdr-module-osmosdr soapysdr-module-redpitaya soapysdr-module-remote soapysdr-module-rfspace soapysdr-module-rtlsdr soapysdr-module-uhd soapysdr-tools soapysdr0.6-module-airspy soapysdr0.6-module-all soapysdr0.6-module-audio soapysdr0.6-module-bladerf soapysdr0.6-module-hackrf soapysdr0.6-module-lms7 soapysdr0.6-module-mirisdr soapysdr0.6-module-osmosdr soapysdr0.6-module-redpitaya soapysdr0.6-module-remote soapysdr0.6-module-rfspace soapysdr0.6-module-rtlsdr soapysdr0.6-module-uhd soundmodem splat svxlink-calibration-tools svxlink-gpio svxlink-server svxreflector tk2 tk5 tlf trustedqsl tucnak twclock twpsk uhd-soapysdr uronode wsjtx wwl xastir xcwcp xdemorse xdx xlog xlog-data xnec2c xnecview yagiuda z8530-utils2  
-    sudo apt-get purge -y akqml bino browser-plugin-gnash browser-plugin-vlc cclive crtmpserver crtmpserver-apps crtmpserver-dev crtmpserver-libs deepin-movie dtv-scan-tables dumphd dvblast dvbstreamer dvdrip-utils ffmpeg flowblade flvmeta freetuxtv frei0r-plugins get-flash-videos gmlive gnash-common-opengl gnash-ext-fileio gnash-ext-lirc gnash-ext-mysql gnash-opengl gnome-dvb-client gnome-dvb-daemon gnome-mpv gnome-twitch gnome-twitch-player-backend-gstreamer-cairo gnome-twitch-player-backend-gstreamer-clutter gnome-twitch-player-backend-gstreamer-opengl gnome-twitch-player-backend-mpv-opengl grilo-plugins-dvb-daemon growisofs gst123 gstreamer1.0-crystalhd h264enc hdmi2usb-fx2-firmware i965-va-driver i965-va-driver-shaders imagination imagination-common kazam klash-opengl kodi kodi-bin kodi-data kodi-eventclients-common kodi-eventclients-kodi-send kodi-eventclients-ps3 kodi-eventclients-wiiremote kodi-pvr-hts kodi-repository-kodi kylin-video libaacs0 libde265-examples libdvbcsa1 libffmpegthumbnailer4v5 libheif-examples libqtav1 libqtavwidgets1 libtotem0 libvlc-bin libxine2-xvdr lives-plugins livestreamer m2vrequantiser mediathekview mencoder minitube mjpegtools-gtk mplayer mplayer-gui mpv multicat nageru nomnom nordlicht obs-plugins obs-studio oggvideotools ogmrip-dirac ogmrip-oggz ogmrip-plugins openalpr openalpr-daemon openshot openshot-qt photofilmstrip qml-module-qtav qstopmotion qtav-players ser-player shotdetect simplescreenrecorder smplayer-l10n smtube sreview-common sreview-detect sreview-encoder sreview-master sreview-web streamlink subliminal-nautilus swfdec-gnome swfdec-mozilla tablet-encode transcode transmageddon tsdecrypt tvnamer va-driver-all vdpau-driver-all vdr-plugin-dvbhddevice vdr-plugin-dvbsddevice vdr-plugin-epgsync vdr-plugin-osdteletext vdr-plugin-satip vdr-plugin-skinenigmang vdr-plugin-softhddevice vdr-plugin-svdrpext vdr-plugin-svdrpext vdr-plugin-svdrposd vdr-plugin-vnsiserver vlc-bin vlc-plugin-access-extra vlc-plugin-base vlc-plugin-fluidsynth vlc-plugin-notify vlc-plugin-qt vlc-plugin-samba vlc-plugin-skins2 vlc-plugin-svg vlc-plugin-video-output vlc-plugin-video-splitter vlc-plugin-visualization vlc-plugin-vlsub vlc-plugin-zvbi voctomix voctomix-core voctomix-gui voctomix-outcasts vokoscreen webcamoid webcamoid-data webcamoid-plugins winff-data winff-gtk2 winff-qt x265 xbmc-pvr-argustv xbmc-pvr-dvbviewer xbmc-pvr-iptvsimple xbmc-pvr-mediaportal-tvserver xbmc-pvr-mythtv-cmyth xbmc-pvr-nextpvr xbmc-pvr-njoy xbmc-pvr-tvheadend-hts xbmc-pvr-vdr-vnsi xbmc-pvr-vuplus xbmc-pvr-wmc xvidenc totem*
-    
-    # Stop and disable services
-    systemctl stop avahi-daemon
-    systemctl disable avahi-daemon
-    systemctl stop 'cups*'
-    systemctl disable 'cups*'
-    systemctl stop slapd
-    systemctl disable slapd
-    systemctl stop rpcbind
-    systemctl disable rpcbind
-    systemctl stop named
-    systemctl disable named
-    systemctl stop httpd
-    systemctl disable httpd
-    systemctl stop dovecot
-    systemctl disable dovecot
-    systemctl stop squid
-    systemctl disable squid
-    systemctl stop rsyncd
-    systemctl disable rsyncd
-    systemctl stop rsync
-    systemctl disable rsync
-    systemctl stop ypserv
-    systemctl disable ypserv
-    systemctl stop 'irc*'
-    systemctl disable 'irc*'
-    systemctl list-units --type=service 
-    echo "Look for anything suspicious above"
-    ll /var/lib/snapd/snaps/
-    echo "Look for anything suspicious above"
-
-        # Configuration
-        CRITICAL_PACKAGES=(
-            "perl" "curl" "python3" "systemd" "apt" "dpkg" "bash" "coreutils"
-            "grep" "sed" "gawk" "util-linux" "mount" "login" "passwd" "adduser"
-        )
-
-        # Set up logging directory
-        SCRIPT_DIR="/var/log/security-cleanup"
-        LOG_FILE="$SCRIPT_DIR/security-cleanup.log"
-
-        # Create logging directory with proper permissions
-        setup_logging() {
-            mkdir -p "$SCRIPT_DIR"
-            touch "$LOG_FILE"
-            chmod 750 "$SCRIPT_DIR"
-            chmod 640 "$LOG_FILE"
-        }
-
-        printTime() {
-            echo "[$(date +%T)] $1" | tee -a "$LOG_FILE"
-        }
-
-        fix_dpkg() {
-            log "Fixing potential dpkg interruptions..." yellow
-            dpkg --configure -a
-            apt-get update -qq
-            apt-get install -f -y -qq
-        }
-
-        is_critical_package() {
-            local package="$1"
-            for critical in "${CRITICAL_PACKAGES[@]}"; do
-                if [[ "$package" == "$critical" ]]; then
-                    return 0
-                fi
-            done
-            return 1
-        }
-
-        is_package_installed() {
-            local package="$1"
-            dpkg -l "$package" 2>/dev/null | grep -q "^ii.*$package "
-            return $?
-        }
-
-        remove_package_suite() {
-            local title="$1"
-            shift
-            local packages=("$@")
-            local removal_failed=0
-            
-            # Ask user for confirmation
-            read -p "Are you sure you want to remove $title? (y/n): " confirm
-            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                log "Aborted. No packages were removed." yellow
-                return 0
-            fi
-
-            log "Removing $title..." yellow
-            for pkg in "${packages[@]}"; do
-                if is_package_installed "$pkg"; then
-                    if DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$pkg"; then
-                        log "Removed $pkg" green
-                    else
-                        log "Failed to remove $pkg" red
-                        removal_failed=1
-                    fi
-                fi
-            done
-
-            if [ $removal_failed -eq 1 ]; then
-                log "Some packages in $title failed to remove. Running dpkg fix..." yellow
-                fix_dpkg
-            else
-                log "$title has been removed." green
-            fi
-        }
-
-        check_hacking_tools() {
-            log "Checking for remaining hacking tools..." yellow
-            dpkg -l | egrep "crack|hack" >> "$LOG_FILE" 2>&1 || true
-            log "Hacking tools check completed and logged to $LOG_FILE" green
-        }
-
-        remove_security_tools() {
-            # Create groups of related packages
-            local netcat_packages=(
-                "netcat" "netcat-openbsd" "netcat-traditional" "ncat"
-                "pnetcat" "socat" "sock" "socket" "sbd" "cryptcat" "nc"
-            )
-            
-            local cracking_tools=(
-                "john" "john-data" "hydra" "hydra-gtk" "aircrack-ng"
-                "fcrackzip" "lcrack" "ophcrack" "ophcrack-cli" "pdfcrack"
-                "pyrit" "rarcrack" "sipcrack" "irpas" "hashcat" "sqlmap"
-                "wifite" "yersinia" "pixiewps" "bbqsql" "reaver"
-                "slowhttptest" "ssldump" "sslstrip" "thc-ipv6" "cupp3"
-                "truecrack" "medusa" "nikto" "sucrack" 
-            )
-
-            local zeitgeist_packages=(
-                "zeitgeist-core" "zeitgeist-datahub" "python-zeitgeist"
-                "rhythmbox-plugin-zeitgeist" "zeitgeist"
-            )
-
-            local additional_packages=(
-                "filebeat"
-                "logstash"
-                "samba"
-                # "ssh"       # BOILERSTORM/cai-db01 SAFETY: keep SSH (your access; may be scored)
-                "dovecot"
-                # "postfix"   # BOILERSTORM/cai-db01 SAFETY: keep in case the app relays mail
-                "endless-sky"
-                # "apache2"   # BOILERSTORM/cai-db01 SAFETY: keep (possible app/web front-end)
-                "wireshark"
-                "nmap"
-                "zmap"
-                "kismet"
-                "networkminer"
-                "ettercap"
-                "4g8"
-                "acccheck"
-                "airgraph-ng"
-                "bittornado"
-                "bluemon"
-                "btscanner"
-                "brutespray"
-                "hunt"
-                "nast"
-                "python-scapy"
-                "sipgrep"
-                "tcpick"
-                "tcpreplay"
-                "tcpslice"
-                "tcptrace"
-                "tcptraceroute"
-                "tcpxtract"
-                "mdk3"
-                "darkstat"
-                "flowscan"
-                "ntopng"
-                "ostinato"
-                "softflowd"
-                "tshark"
-                "rfdump"
-                "heartbleeder"
-                "cmospwd"
-                "irc"
-                "hexchat"
-                "irssi"
-                "weechat"
-                "xchat"
-                "konversation"
-                "eggdrop"
-                "bitchx"
-                "pirc"
-                "vuze"
-                "frostwire"
-                "freeciv"
-                "minetest"
-                "tightvncserver"
-                "x11vnc"
-                "nfs"
-                "xinetd"
-                "smb"
-                # "postgresql" # BOILERSTORM/cai-db01 SAFETY: THIS IS (likely) THE SCORED DB - never purge
-                "sftpd"
-                "vsftpd"
-                "ftp"
-                # "mysql"     # BOILERSTORM/cai-db01 SAFETY: THIS IS (likely) THE SCORED DB - never purge
-                # "php"       # BOILERSTORM/cai-db01 SAFETY: keep (possible app runtime)
-                "snmp"
-                "pop3"
-                "icmp"
-                "sendmail"
-                "bind9"
-                # "nginx"     # BOILERSTORM/cai-db01 SAFETY: keep (possible app/web front-end)
-                "telnet"
-                "rlogind"
-                "rshd"
-                "rcmd"
-                "rexecd"
-                "rbootd"
-                "rquotad"
-                "rstatd"
-                "rusersd"
-                "rwalld"
-                "rexd"
-                "fingerd"
-                "tftpd"
-                "logkeys"
-                "dns"
-                "xserver-xorg"
-                "ypbind"
-                "talk"
-                "openldap-clients"
-                "tcpdump"
-                "snort"
-                "fwsnort"
-                "nessus"
-                "traceroute"
-                "httrack"
-                "openvas"
-                "torrent"
-                "sniff"
-                "bluetooth"
-                "remmina"
-                "linuxdcpp"
-                "bro"
-                "jellyfin"
-                "anydesk"
-                "teamviewer"
-                "burpsuite"
-                "deluge"
-                "chromium"
-                "powershell"
-                "dsniff"
-                "qbittorrent"
-                "metasploit-framework"
-                "teamspeak"
-            )
-
-            # Create backup
-            local backup_file="/root/package-list-backup-$(date +%Y%m%d-%H%M%S).txt"
-            log "Creating backup of current package list to $backup_file..." green
-            dpkg --get-selections > "$backup_file"
-            
-            # Fix any existing dpkg issues before starting
-            fix_dpkg
-            
-            # Remove package suites
-            remove_package_suite "Netcat and related packages" "${netcat_packages[@]}"
-            remove_package_suite "Cracking tools" "${cracking_tools[@]}"
-            remove_package_suite "Zeitgeist packages" "${zeitgeist_packages[@]}"
-            remove_package_suite "Additional security tools" "${additional_packages[@]}"
-            
-            # Remove nc binary if it exists
-            if [ -f /usr/bin/nc ]; then
-                rm -f /usr/bin/nc
-                log "Removed nc binary" green
-            fi
-            
-            # Final dpkg fix
-            fix_dpkg
-            
-            # Check for remaining hacking tools
-            # check_hacking_tools
-        }
-
-        cleanup() {
-            # Compress log file if it exists
-            if [ -f "$LOG_FILE" ]; then
-                gzip -f "$LOG_FILE"
-                log "Log file has been compressed to ${LOG_FILE}.gz" green
-            fi
-        }
-
-        main() {
-            check_root
-            setup_logging
-            
-            # Initialize log file
-            echo "=== Security Cleanup Script Log $(date) ===" > "$LOG_FILE"
-            
-            # Trap for cleanup on script exit
-            trap cleanup EXIT
-            
-            remove_security_tools
-            
-            log "Package cleanup completed." green
-            log "Log file has been saved to: $LOG_FILE" green
-            log "If you experience any issues, you can reinstall packages using the backup created at the start." yellow
-        }
-        main
-    }
-
-    userAudit() {
-    # ============================ BOILERSTORM/cai-db01 WARNING ============================
-    # This function RESETS EVERY user's password to a hard-coded default and ADDS/DELETES
-    # users based on a correct.txt roster. On a scored box that is dangerous:
-    #   * Changing a scored account's password WITHOUT first filing a Password Change
-    #     Request (PCR) in Quotient makes its SSH/service checks FAIL (packet Section 5).
-    #   * deluser --remove-home can delete a scored service account and its data.
-    # Do NOT run this on cai-db01 unless you know exactly which accounts are scored and have
-    # filed PCRs for them. It also requires a correct.txt roster file in the CWD.
-    # =====================================================================================
-    # Validate username function
-    validate_username() {
-        local username="$1"
-        # Linux-specific username requirements
-        if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] ||
-        [[ "$username" =~ ^(root|daemon|bin|sys|system|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|nobody|_apt|admin)$ ]]; then
-            log "Invalid username format or reserved username: $username" red
-            return 1
-        fi
-        return 0
-    }
-
-    # Define special accounts and their specific shells
-    declare -A SPECIAL_ACCOUNTS=(
-        ["root"]="/bin/bash"
-        ["bin"]="/usr/sbin/nologin"
-        ["daemon"]="/bin/false"
-        ["sync"]="/bin/sync"
-        ["shutdown"]="/sbin/shutdown"
-        ["halt"]="/sbin/halt"
-        ["ftp"]="/usr/sbin/nologin"
-        ["nobody"]="/usr/sbin/nologin"
-        ["sshd"]="/usr/sbin/nologin"
-    )
-
-    # Secure hashing algorithms
-    SECURE_HASHES=("6" "y") # SHA-512 ($6$) and yescrypt ($y$)
-
-    check_root
-
-    local FILE="correct.txt"
-    local DEFAULT_PASSWORD="CyberPatriot101#!"
-
-    # Read file content and replace newlines with spaces
-    local readmeContent=$(cat "$FILE" | tr '\n' ' ')
-
-    # Extract Authorized Administrators
-    local result=$(echo "$readmeContent" | awk -F 'Authorized Administrators:' '{print $2}' | awk -F 'Authorized Users:' '{print $1}' | xargs)
-    log "Authorized Administrators: $result" yellow
-
-    # Turn to array
-    read -ra correctAdmins <<< "$result"
-
-    # Extract Authorized Users
-    result=$(echo "$readmeContent" | awk -F 'Authorized Users:' '{print $2}' | xargs) 
-    log "Authorized Users: $result" yellow
-
-    # Turn to array
-    read -ra correctUsers <<< "$result"
-
-    # Validate usernames
-    for admin in "${correctAdmins[@]}"; do
-        if ! validate_username "$admin"; then
-            log "Invalid administrator username detected. Aborting." red
-            return 1
-        fi
-    done
-
-    for user in "${correctUsers[@]}"; do
-        if ! validate_username "$user"; then
-            log "Invalid user username detected. Aborting." red
-            return 1
-        fi
-    done
-
-    # Remove whitespace from each element in the arrays
-    for i in "${!correctAdmins[@]}"; do
-        correctAdmins[i]=$(echo "${correctAdmins[i]}" | tr -d '[:space:]')
-    done
-
-    for i in "${!correctUsers[@]}"; do
-        correctUsers[i]=$(echo "${correctUsers[i]}" | tr -d '[:space:]')
-    done
-
-    # Get a list of all local users
-    local currentUsers=($(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd))
-
-    # Get a list of all admins
-    local currentAdmins=($(grep '^sudo:.*$' /etc/group | awk -F: '{print $4}' | tr ',' ' '))
-
-    # Combine valid users
-    local validUsers=("${correctUsers[@]}" "${correctAdmins[@]}")
-
-    # Add new users
-    for user in "${correctUsers[@]}"; do
-        if [[ ! " ${currentUsers[@]} " =~ " $user " ]]; then
-            useradd "$user" --disabled-password --gecos ""
-            log "Added user: $user" yellow
-        fi
-    done
-
-    # Add new admins or convert existing users to admins
-    for admin in "${correctAdmins[@]}"; do    
-        if [[ ! " ${currentAdmins[@]} " =~ " $admin " ]]; then
-            if [[ " ${currentUsers[@]} " =~ " $admin " ]]; then
-                usermod -aG sudo "$admin"
-                log "Converted user to admin: $admin" yellow
-            else
-                useradd -m -p "$(openssl passwd -6 "$DEFAULT_PASSWORD")" "$admin"
-                usermod -aG sudo "$admin"
-                log "Added admin: $admin" yellow
-            fi
-        fi
-    done
-
-    # Remove unauthorized users
-    for user in "${currentUsers[@]}"; do
-        if [[ ! " ${validUsers[@]} " =~ " $user " ]]; then
-            deluser --remove-home "$user" 2>/dev/null
-            log "Deleted user and their files: $user" yellow
-        fi
-    done
-
-    # Remove unauthorized admins
-    for admin in "${currentAdmins[@]}"; do
-        if [[ ! " ${correctAdmins[@]} " =~ " $admin " ]]; then
-            if [[ " ${correctUsers[@]} " =~ " $admin " ]]; then
-                deluser "$admin" sudo
-                log "Converted admin to user: $admin" yellow
-            else
-                deluser --remove-home "$admin"
-                log "Removed admin: $admin" yellow
-            fi
-        fi
-    done
-
-    # Password and account management for admins
-    for admin in "${correctAdmins[@]}"; do
-        # Set min and max days for password change
-        chage -m 15 -M 60 "$admin"
-        # Set the account inactivity period
-        chage -I 5 "$admin"
-        # Set password expiration warning days
-        chage -W 7 "$admin"
-        
-        # Set password
-        echo "$admin:$DEFAULT_PASSWORD" | sudo chpasswd
-        
-        # Ensure account is unlocked
-        if passwd -S "$admin" | grep -q "L"; then
-            passwd -u "$admin"
-        fi 
-
-        # Ensure bash shell
-        chsh -s /bin/bash "$admin"
-    done
-
-    # Password and account management for users
-    for user in "${correctUsers[@]}"; do 
-        # Set min and max days for password change
-        chage -m 15 -M 60 "$user"
-        # Set the account inactivity period
-        chage -I 5 "$user"
-        # Set password expiration warning days
-        chage -W 7 "$user"
-        
-        # Set password
-        echo "$user:$DEFAULT_PASSWORD" | sudo chpasswd
-        
-        # Ensure account is unlocked
-        if passwd -S "$user" | grep -q "L"; then
-            passwd -u "$user"
-        fi   
-
-        # Ensure bash shell
-        chsh -s /bin/bash "$user"
-    done
-
-    # Additional security checks
-
-    # Check for missing groups
-    local missing_groups=()
-    for gid in $(awk -F: '{print $4}' /etc/passwd | sort -u); do
-        if ! grep -q -P "^[^:]*:[^:]*:$gid:" /etc/group; then
-            missing_groups+=("$gid")
-        fi
-    done
-
-    if [ ${#missing_groups[@]} -gt 0 ]; then
-        for group in "${missing_groups[@]}"; do
-            log "Group $group is referenced in /etc/passwd but does not exist in /etc/group." red
-        done
-    fi
-
-    # Check for duplicate UIDs, GIDs, and usernames
-    awk -F: '{print $3}' /etc/passwd | sort | uniq -d | while read -r uid; do
-        users=$(awk -F: -v uid="$uid" '($3 == uid) {print $1}' /etc/passwd | xargs)
-        log "Duplicate UID ($uid): $users" red
-    done
-
-    awk -F: '{print $3}' /etc/group | sort | uniq -d | while read -r gid; do
-        groups=$(awk -F: -v gid="$gid" '($3 == gid) {print $1}' /etc/group | xargs)
-        log "Duplicate GID ($gid): $groups" red
-    done
-
-    cut -d":" -f1 /etc/passwd | sort | uniq -d | while read -r username; do
-        uids=$(awk -F: -v name="$username" '($1 == name) { print $3 }' /etc/passwd | xargs)
-        log "Duplicate Username ($username): UIDs $uids" red
-    done
-
-    # Shadow group check
-    if grep -q "^shadow:" /etc/group; then
-        local shadow_users=$(grep "^shadow:" /etc/group | cut -d: -f4)
-        if [ -n "$shadow_users" ]; then
-            log "Warning: The 'shadow' group is not empty. Users: $shadow_users" red
-        fi
-    else
-        log "Error: The 'shadow' group does not exist." red
-    fi
-
-    # Hash algorithm security check
-    log "Checking /etc/shadow for secure hashing algorithms..." yellow
-    for username in "${validUsers[@]}"; do
-        local userLine=$(grep "^$username:" /etc/shadow)
-        
-        if [[ -z $userLine ]]; then
-            log "User '$username' not found in /etc/shadow." yellow
-            continue
-        fi
-
-        IFS=: read -r _ password _ <<< "$userLine"
-
-        if [[ -z $password || $password == "!" || $password == "*" ]]; then
-            log "User '$username' has no password or the account is locked." yellow
-            continue
-        fi
-
-        local hash_algo=$(echo "$password" | awk -F'$' '{print $2}')
-        
-        if [[ -n $hash_algo && ! " ${SECURE_HASHES[*]} " =~ " $hash_algo " ]]; then
-            log "Insecure hashing algorithm found for user '$username': \$${hash_algo}\$" red
-        fi
-    done
-
-    # Home directory management
-    for user in "${validUsers[@]}"; do
-        local home_dir="/home/$user"
-        if [ ! -d "$home_dir" ]; then
-            mkdir -m 700 "$home_dir"
-            chown "$user:$user" "$home_dir"
-            log "Created home directory for $user" green
-        else
-            chmod 700 "$home_dir"
-            chown "$user:$user" "$home_dir"
-        fi
-    done
-
-    # Lock and set shells for special and non-special accounts
-    local all_users=$(getent passwd | awk -F: '{print $1}')
-    for user in $all_users; do
-        if [[ -n "${SPECIAL_ACCOUNTS[$user]}" ]]; then
-            passwd -l "$user"
-            local current_shell=$(getent passwd "$user" | cut -d: -f7)
-            if [[ "$current_shell" != "${SPECIAL_ACCOUNTS[$user]}" ]]; then
-                chsh -s "${SPECIAL_ACCOUNTS[$user]}" "$user"
-                log "Shell for special account '$user' changed from '$current_shell' to '${SPECIAL_ACCOUNTS[$user]}'." yellow
-            fi
-        else
-            if [[ ! " ${validUsers[@]} " =~ " $user " ]]; then
-                passwd -l "$user"
-                local current_shell=$(getent passwd "$user" | cut -d: -f7)
-                if [[ "$current_shell" != "/bin/false" && "$current_shell" != "/usr/sbin/nologin" ]]; then
-                    chsh -s "/bin/false" "$user"
-                    log "Shell for user '$user' changed to /bin/false." yellow
-                fi
-            fi
-        fi
-    done
-
-    log "User audit and management complete." green
 }
 
-    upgradeAndUpdate() {
-    # unhold packages
-    apt-mark unhold $(apt-mark showhold)
+log_msg() {
+    local level="$1"
+    local msg="$2"
+    local color_reset="\033[0m"
+    local color=""
 
-    # Update package lists
-    apt-get update 
-
-    # Upgrade installed packages
-    apt-get upgrade 
-
-    # Perform a distribution upgrade
-    # apt-get dist-upgrade -qq -y
-
-    # Install unattended-upgrades if not already installed
-    apt-get install -y unattended-upgrades
-    dpkg-reconfigure unattended-upgrades 
-
-    echo -e "APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Download-Upgradeable-Packages \"1\";\nAPT::Periodic::AutocleanInterval \"7\";" > /etc/apt/apt.conf.d/10periodic
-
-    echo -e "APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";" > /etc/apt/apt.conf.d/20auto-upgrades
-
-    # Edit /etc/apt/apt.conf.d/50auto-upgrades using sed
-    # sed -i '1s//Unattended-Upgrade::Allowed-Origins {\n"\${distro_id} stable";\n"\${distro_id} \${distro_codename}-security";\n"\${distro_id} \${distro_codename}-updates";\n};\n\n/' /etc/apt/apt.conf.d/50auto-upgrades
-
-    # echo 'APT::Periodic::Update-Package-Lists "1"; APT::Periodic::Download-Upgradeable-Packages "1"; APT::Periodic::AutocleanInterval "7"; APT::Periodic::Unattended-Upgrade "1"; APT::Periodic::Verbose "3"; APT::Periodic::RandomSleep "1800"; APT::Periodic::Unattended-Upgrade::Automatic-Reboot "0"; APT::Sandbox::Seccomp "true"; APT::Sandbox::ResetEnvironment "true"; APT::Get::AllowUnauthenticated "false"; Acquire::ForceHash "sha256"; Acquire::AllowInsecureRepositories "0"; Acquire::AllowDowngradeToInsecureRepositories "0"; Acquire::AllowWeakRepositories "0"; Unattended-Upgrade::Remove-Unused-Dependencies "true"; Unattended-Upgrade::Remove-Unused-Kernel-Packages "true"; Unattended-Upgrade::Allowed-Origins { "${distro_id} stable"; "${distro_id} ${distro_codename}-security"; "${distro_id} ${distro_codename}-updates"; }; Unattended-Upgrade::Automatic-Reboot "false"; APT::Periodic::AutocleanInterval "1";' | sudo tee /etc/apt/apt.conf.d/50unattended-upgrades 
-
-    echo "Automatic updates have been enabled."
-    echo "Unattended upgrades configuration completed."
-
-    apt list --installed | grep upgradable
-    }
-
-    # Function to display the menu
-    display_menu() {
-    echo "----------------------------------------------------------"
-    echo "| 0. Quit                   | 1. Upgrade and Update      |"
-    echo "| 2. Delete Files           | 3. Set Permissions         |"
-    echo "| 4. Baseline Extensions    | 5. User Auditing           |"
-    echo "| 6. Password Policies      | 7. Packages & Services     |"
-    echo "| 8. Harden Kernel          | 9. Sudoers Config          |"
-    echo "| 10. Prevent Cron Jobs     | 11. LightDM Config         |"
-    echo "| 12. GDM3 Config           | 13. GNOME Settings         |"
-    echo "| 14. GRUB Config           | 15. Network Config         |"
-    echo "| 16. Systemd Config        | 17. Security Tools         |"
-    echo "| 18. Malware Hunt          | 19. Quit                   |"
-    echo "----------------------------------------------------------"
-    echo "\nFunctions in Progress: 4. Baseline Extensions, 14. Grub Config, 18. Malware Hunt"
-    }
-
-
-    execute_method() {
-    case $1 in
-        0) echo "Exiting script. Goodbye!"; exit ;;
-        1) upgradeAndUpdate ;;
-        2) deleteFiles ;;
-        3) setPermissions ;;
-        4) baselineExt ;;
-        5) userAudit ;; 
-        6) passwordPolicies;;
-        7) packagesAndServices ;;
-        8) kernelHarden ;;
-        9) sudoersConfig ;;
-        10) preventCronJobs ;;
-        11) lightDMConfig ;;
-        12) gdm3Config ;;
-        13) gnomeSettings ;; 
-        14) grubConfig ;;
-        15) networkConfig ;;
-        16) systemdConfig ;;
-        17) securityTools ;;
-        18) malwareHunt ;;
-        19) echo "Exiting script. Goodbye!"; exit ;;
-        *) echo "Invalid choice. Please enter a valid number." ;;
+    case "$level" in
+        INFO)    color="\033[36m" ;; # Cyan
+        OK)      color="\033[32m" ;; # Green
+        WARN)    color="\033[33m" ;; # Yellow
+        ALERT)   color="\033[31m" ;; # Red
+        ACTION)  color="\033[35m" ;; # Magenta
+        DRYRUN)  color="\033[34m" ;; # Blue
+        *)       color="" ;;
     esac
-    }
 
-    # Main script
-    while true; do
-    display_menu
-    read -p "Enter the number of the method (or 0 to quit): " choice
+    local formatted="[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg"
+    echo -e "${color}${formatted}${color_reset}"
+    echo "$formatted" >> "$LOG_FILE" 2>/dev/null
+}
 
-    if [[ $choice == 0 ]]; then
-        echo "Exiting script. Goodbye!"
-        exit
-    elif [[ $choice =~ ^[1-9][0-9]*$ && $choice -le 44 ]]; then
-        execute_method "$choice"
-    else
-        echo "Invalid input. Please enter a valid number."
+print_header() {
+    echo ""
+    echo "=============================================================================="
+    echo " $1"
+    echo "=============================================================================="
+    echo "=== $1 ===" >> "$LOG_FILE" 2>/dev/null
+}
+
+# ==============================================================================
+# 3. ROOT PRIVILEGE & OS VERIFICATION
+# ==============================================================================
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_msg "ALERT" "This operation requires root privileges. Please run as root or via sudo."
+        return 1
     fi
+    return 0
+}
+
+verify_rocky_linux() {
+    print_header "OS & ENVIRONMENT VERIFICATION"
+    if [[ ! -f /etc/os-release ]]; then
+        log_msg "ALERT" "/etc/os-release not found. Cannot verify operating system."
+        return 1
+    fi
+
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    log_msg "INFO" "Detected OS: ${PRETTY_NAME:-Unknown} (ID: ${ID:-Unknown}, Version: ${VERSION_ID:-Unknown})"
+
+    if [[ "$ID" != "rocky" && "$ID" != "rhel" && "$ID" != "almalinux" && "$ID" != "centos" ]]; then
+        log_msg "ALERT" "OS '$ID' is not Rocky Linux / RHEL family! Aborting to prevent system damage."
+        exit 1
+    fi
+
+    log_msg "OK" "RHEL/Rocky Linux compatibility verified."
+    return 0
+}
+
+# ==============================================================================
+# 4. BACKUP AND ROLLBACK SUPPORT
+# ==============================================================================
+backup_file() {
+    local target="$1"
+    if [[ ! -e "$target" ]]; then
+        return 0
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_msg "DRYRUN" "Would back up '$target' to '${BACKUP_ROOT}${target}'"
+        return 0
+    fi
+
+    require_root || return 1
+    local dest_dir
+    dest_dir="${BACKUP_ROOT}$(dirname "$target")"
+    mkdir -p "$dest_dir"
+    chmod 700 "$BACKUP_ROOT"
+
+    if cp -a "$target" "${BACKUP_ROOT}${target}"; then
+        log_msg "INFO" "Backed up '$target' -> '${BACKUP_ROOT}${target}'"
+        return 0
+    else
+        log_msg "ALERT" "Failed to back up '$target'!"
+        return 1
+    fi
+}
+
+show_rollback_instructions() {
+    print_header "BACKUP & ROLLBACK INSTRUCTIONS"
+    log_msg "INFO" "All modified configuration files are backed up with preserved permissions and SELinux contexts under:"
+    log_msg "INFO" "  ${BACKUP_ROOT}"
+    echo ""
+    echo "To roll back a specific file (example: /etc/ssh/sshd_config):"
+    echo "  cp -a ${BACKUP_ROOT}/etc/ssh/sshd_config /etc/ssh/sshd_config"
+    echo "  restorecon -v /etc/ssh/sshd_config"
+    echo "  systemctl reload sshd"
+    echo ""
+    echo "To list all backups taken in this session:"
+    echo "  find ${BACKUP_ROOT} -type f 2>/dev/null"
+}
+
+# Helper for executing or simulating hardening commands
+run_cmd() {
+    local desc="$1"
+    shift
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_msg "DRYRUN" "$desc -> Command: $*"
+        return 0
+    else
+        log_msg "ACTION" "$desc"
+        if "$@"; then
+            return 0
+        else
+            local rc=$?
+            log_msg "ALERT" "Command failed (exit $rc): $*"
+            return $rc
+        fi
+    fi
+}
+
+# ==============================================================================
+# 5. MAIL-SERVER STACK DETECTION & CHECKS (PRIORITY MODULE)
+# ==============================================================================
+detect_mail_stack() {
+    ACTIVE_MAIL_SERVICES=()
+    ACTIVE_MAIL_PORTS=()
+    IPV6_REQUIRED=0
+
+    local mail_candidates=(
+        "postfix" "dovecot" "sendmail" "exim" "cyrus-imapd"
+        "opendkim" "opendmarc" "spamassassin" "spamd" "clamd@scan"
+        "amavisd" "httpd" "nginx" "mariadb" "postgresql" "named" "slapd"
+    )
+
+    for svc in "${mail_candidates[@]}"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null || systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            ACTIVE_MAIL_SERVICES+=("$svc")
+        fi
     done
+
+    # Check listening mail ports
+    for port in "${MAIL_PORTS_TCP[@]}"; do
+        if ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then
+            ACTIVE_MAIL_PORTS+=("$port")
+        fi
+    done
+
+    # Check if Postfix or Dovecot or system is actively binding IPv6 on mail ports or configured for IPv6
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq "\[::\]:(25|465|587|110|143|993|995)$"; then
+        IPV6_REQUIRED=1
+    fi
+    if [[ -f /etc/postfix/main.cf ]] && grep -Eq "^[[:space:]]*inet_protocols[[:space:]]*=[[:space:]]*(all|.*ipv6)" /etc/postfix/main.cf; then
+        IPV6_REQUIRED=1
+    fi
+    if [[ -f /etc/dovecot/dovecot.conf ]] && grep -Eq "^[[:space:]]*listen[[:space:]]*=.*::" /etc/dovecot/dovecot.conf; then
+        IPV6_REQUIRED=1
+    fi
+}
+
+audit_mail_stack() {
+    print_header "MAIL SERVER STACK & OPERATIONAL AUDIT (READ-ONLY)"
+    detect_mail_stack
+
+    if [[ ${#ACTIVE_MAIL_SERVICES[@]} -gt 0 ]]; then
+        log_msg "OK" "Detected active/enabled mail & supporting services: ${ACTIVE_MAIL_SERVICES[*]}"
+    else
+        log_msg "WARN" "No standard mail services detected as active/enabled via systemd!"
+    fi
+
+    if [[ ${#ACTIVE_MAIL_PORTS[@]} -gt 0 ]]; then
+        log_msg "OK" "Detected listening mail TCP ports: ${ACTIVE_MAIL_PORTS[*]}"
+    else
+        log_msg "WARN" "No standard mail TCP ports (25, 465, 587, 110, 143, 993, 995) are currently listening!"
+    fi
+
+    if [[ $IPV6_REQUIRED -eq 1 ]]; then
+        log_msg "INFO" "IPv6 is actively used or configured by the mail stack. IPv6 MUST NOT be disabled."
+    else
+        log_msg "INFO" "No explicit IPv6 bindings detected on mail ports (still preserving IPv6 loopback for stability)."
+    fi
+
+    # Postfix checks
+    if command -v postconf >/dev/null 2>&1 && [[ -d /etc/postfix ]]; then
+        log_msg "INFO" "--- Postfix Configuration Audit ---"
+        local myhostname mydomain mynetworks inet_interfaces smtpd_banner relay_restrictions
+        myhostname="$(postconf -h myhostname 2>/dev/null)"
+        mydomain="$(postconf -h mydomain 2>/dev/null)"
+        mynetworks="$(postconf -h mynetworks 2>/dev/null)"
+        inet_interfaces="$(postconf -h inet_interfaces 2>/dev/null)"
+        smtpd_banner="$(postconf -h smtpd_banner 2>/dev/null)"
+        relay_restrictions="$(postconf -h smtpd_relay_restrictions 2>/dev/null)"
+
+        log_msg "INFO" "Postfix myhostname: $myhostname | mydomain: $mydomain"
+        log_msg "INFO" "Postfix inet_interfaces: $inet_interfaces"
+        log_msg "INFO" "Postfix mynetworks: $mynetworks"
+        log_msg "INFO" "Postfix smtpd_banner: $smtpd_banner"
+        log_msg "INFO" "Postfix smtpd_relay_restrictions: $relay_restrictions"
+
+        # Open relay check on mynetworks
+        if echo "$mynetworks" | grep -Eq "(0\.0\.0\.0/0|::/0)"; then
+            log_msg "ALERT" "Postfix mynetworks contains 0.0.0.0/0 or ::/0 (OPEN RELAY RISK)!"
+        fi
+        if ! echo "$relay_restrictions" | grep -Eq "(reject_unauth_destination|defer_unauth_destination)"; then
+            log_msg "ALERT" "Postfix smtpd_relay_restrictions may lack reject_unauth_destination!"
+        fi
+
+        # Check Postfix TLS settings
+        local tls_level tls_cert tls_key
+        tls_level="$(postconf -h smtpd_tls_security_level 2>/dev/null)"
+        tls_cert="$(postconf -h smtpd_tls_cert_file 2>/dev/null)"
+        tls_key="$(postconf -h smtpd_tls_key_file 2>/dev/null)"
+        log_msg "INFO" "Postfix TLS level: ${tls_level:-none} | Cert: ${tls_cert:-unset} | Key: ${tls_key:-unset}"
+        if [[ -n "$tls_key" && -f "$tls_key" ]]; then
+            local key_perms
+            key_perms="$(stat -c "%a %U:%G" "$tls_key" 2>/dev/null)"
+            log_msg "INFO" "Postfix TLS private key permissions: $tls_key ($key_perms)"
+        fi
+
+        # Check mail queue count (non-destructive)
+        if command -v mailq >/dev/null 2>&1; then
+            local queue_summary
+            queue_summary="$(mailq 2>/dev/null | tail -n 1)"
+            log_msg "INFO" "Postfix Mail Queue Summary: ${queue_summary:-Empty}"
+        fi
+    fi
+
+    # Dovecot checks
+    if command -v doveconf >/dev/null 2>&1 && [[ -d /etc/dovecot ]]; then
+        log_msg "INFO" "--- Dovecot Configuration Audit ---"
+        local disable_plaintext auth_mechs mail_loc ssl_status
+        disable_plaintext="$(doveconf -h disable_plaintext_auth 2>/dev/null)"
+        auth_mechs="$(doveconf -h auth_mechanisms 2>/dev/null)"
+        mail_loc="$(doveconf -h mail_location 2>/dev/null)"
+        ssl_status="$(doveconf -h ssl 2>/dev/null)"
+        log_msg "INFO" "Dovecot ssl: $ssl_status | disable_plaintext_auth: $disable_plaintext"
+        log_msg "INFO" "Dovecot auth_mechanisms: $auth_mechs | mail_location: $mail_loc"
+
+        if [[ "$ssl_status" == "no" ]]; then
+            log_msg "WARN" "Dovecot SSL is set to 'no'. Verify if SSL/TLS is scored or required."
+        fi
+    fi
+
+    # Mail storage directories check (Read-only inspection)
+    for mdir in /var/spool/mail /var/mail /var/spool/postfix /var/vmail /home; do
+        if [[ -e "$mdir" ]]; then
+            local mstat
+            mstat="$(stat -c "%a %U:%G %C" "$mdir" 2>/dev/null)"
+            log_msg "INFO" "Storage Path $mdir -> Mode/Owner/SELinux: $mstat"
+        fi
+    done
+
+    # DNS Resolution check (essential for MX/A record lookups)
+    log_msg "INFO" "--- Mail DNS & Hostname Verification ---"
+    log_msg "INFO" "System Hostname: $(hostname -f 2>/dev/null || hostname)"
+    if [[ -f /etc/resolv.conf ]]; then
+        local nameservers
+        nameservers="$(grep -E '^[[:space:]]*nameserver' /etc/resolv.conf | awk '{print $2}' | xargs)"
+        log_msg "INFO" "Configured Nameservers (/etc/resolv.conf): ${nameservers:-NONE!}"
+        if [[ -z "$nameservers" ]]; then
+            log_msg "ALERT" "No nameservers configured in /etc/resolv.conf! Mail delivery will fail."
+        fi
+    fi
+}
+
+# ==============================================================================
+# 6. MODULE A: USER AND ACCOUNT MANAGEMENT
+# ==============================================================================
+is_protected_account() {
+    local acct="$1"
+    for p in "${PROTECTED_ACCOUNTS[@]}"; do
+        [[ "$acct" == "$p" ]] && return 0
+    done
+    return 1
+}
+
+validate_username_syntax() {
+    local username="$1"
+    if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]{0,31}[$]?$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+audit_users_and_accounts() {
+    print_header "MODULE A: USER AND ACCOUNT AUDIT (READ-ONLY)"
+
+    # 1. Check UID 0 accounts
+    local uid0_users
+    uid0_users="$(awk -F: '$3 == 0 {print $1}' /etc/passwd | xargs)"
+    if [[ "$uid0_users" == "root" ]]; then
+        log_msg "OK" "Only 'root' has UID 0."
+    else
+        log_msg "ALERT" "Multiple accounts with UID 0 detected: $uid0_users"
+    fi
+
+    # 2. Check human/standard accounts (UID >= 1000, excluding nobody/nfsnobody)
+    log_msg "INFO" "Standard user accounts (UID >= 1000):"
+    awk -F: '$3 >= 1000 && $1 !~ /^(nobody|nfsnobody)$/ {printf "  - %-20s UID: %-6s GID: %-6s Home: %-20s Shell: %s\n", $1, $3, $4, $6, $7}' /etc/passwd | tee -a "$LOG_FILE"
+
+    # 3. Check system accounts (UID < 1000) with interactive login shells
+    log_msg "INFO" "Checking system accounts (UID < 1000) with interactive login shells:"
+    while IFS=: read -r uname _ uid _ _ _ shell; do
+        if [[ "$uid" -lt 1000 && "$uname" != "root" && "$uname" != "sync" && "$uname" != "shutdown" && "$uname" != "halt" ]]; then
+            if [[ "$shell" != "/sbin/nologin" && "$shell" != "/usr/sbin/nologin" && "$shell" != "/bin/false" ]]; then
+                log_msg "ALERT" "System account '$uname' (UID $uid) has an interactive shell: $shell"
+            fi
+        fi
+    done < /etc/passwd
+
+    # 4. Check wheel group members (Rocky Linux administrative group)
+    local wheel_members
+    wheel_members="$(getent group wheel | awk -F: '{print $4}')"
+    log_msg "INFO" "Members of administrative 'wheel' group: ${wheel_members:-<none>}"
+
+    # 5. Check for accounts with empty passwords in /etc/shadow
+    if [[ $EUID -eq 0 ]]; then
+        local empty_pw
+        empty_pw="$(awk -F: '($2 == "") {print $1}' /etc/shadow | xargs)"
+        if [[ -n "$empty_pw" ]]; then
+            log_msg "ALERT" "Accounts with EMPTY passwords in /etc/shadow: $empty_pw"
+        else
+            log_msg "OK" "No accounts have empty password fields in /etc/shadow."
+        fi
+    fi
+
+    # 6. Check duplicate UIDs, GIDs, and Usernames
+    local dup_uids dup_gids dup_names
+    dup_uids="$(awk -F: '{print $3}' /etc/passwd | sort | uniq -d | xargs)"
+    dup_gids="$(awk -F: '{print $3}' /etc/group | sort | uniq -d | xargs)"
+    dup_names="$(awk -F: '{print $1}' /etc/passwd | sort | uniq -d | xargs)"
+    [[ -n "$dup_uids" ]] && log_msg "ALERT" "Duplicate UIDs detected: $dup_uids" || log_msg "OK" "No duplicate UIDs."
+    [[ -n "$dup_gids" ]] && log_msg "ALERT" "Duplicate GIDs detected: $dup_gids" || log_msg "OK" "No duplicate GIDs."
+    [[ -n "$dup_names" ]] && log_msg "ALERT" "Duplicate Usernames detected: $dup_names" || log_msg "OK" "No duplicate Usernames."
+}
+
+manage_user_accounts() {
+    print_header "MODULE A: USER ACCOUNT RECONCILIATION (ROSTER-BASED)"
+    require_root || return 1
+
+    log_msg "INFO" "Looking for external user roster file at: $USER_ROSTER_FILE"
+    log_msg "INFO" "Expected format per line: username:role  (where role is 'admin' or 'user'; lines starting with # are ignored)"
+
+    if [[ ! -f "$USER_ROSTER_FILE" ]]; then
+        log_msg "WARN" "Roster file '$USER_ROSTER_FILE' not found."
+        log_msg "INFO" "To use this module, create '$USER_ROSTER_FILE' with entries like:"
+        log_msg "INFO" "  alice:admin"
+        log_msg "INFO" "  bob:user"
+        return 1
+    fi
+
+    local -A roster_role=()
+    local line uname role
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip comments and whitespace
+        line="${line%%#*}"
+        line="$(echo "$line" | xargs)"
+        [[ -z "$line" ]] && continue
+
+        IFS=: read -r uname role <<< "$line"
+        uname="$(echo "$uname" | xargs)"
+        role="$(echo "$role" | tr '[:upper:]' '[:lower:]' | xargs)"
+
+        if ! validate_username_syntax "$uname"; then
+            log_msg "ALERT" "Invalid username syntax in roster: '$uname'. Aborting reconciliation for safety."
+            return 1
+        fi
+        if [[ "$role" != "admin" && "$role" != "user" ]]; then
+            log_msg "ALERT" "Invalid role '$role' for user '$uname' (must be 'admin' or 'user'). Aborting."
+            return 1
+        fi
+        roster_role["$uname"]="$role"
+    done < "$USER_ROSTER_FILE"
+
+    if [[ ${#roster_role[@]} -eq 0 ]]; then
+        log_msg "WARN" "Roster file is empty. Nothing to reconcile."
+        return 1
+    fi
+
+    log_msg "INFO" "Loaded ${#roster_role[@]} valid users from roster."
+
+    # 1. Verify existence & privilege level for roster users
+    for uname in "${!roster_role[@]}"; do
+        role="${roster_role[$uname]}"
+        if ! id "$uname" >/dev/null 2>&1; then
+            log_msg "WARN" "Roster user '$uname' ($role) does NOT exist on system."
+            read -r -p "Create missing user '$uname'? (y/N): " confirm_create
+            if [[ "$confirm_create" =~ ^[Yy]$ ]]; then
+                run_cmd "Creating user '$uname'" useradd -m -s /bin/bash "$uname"
+            fi
+        fi
+
+        if id "$uname" >/dev/null 2>&1; then
+            local in_wheel=0
+            id -nG "$uname" | grep -qw "wheel" && in_wheel=1
+
+            if [[ "$role" == "admin" && $in_wheel -eq 0 ]]; then
+                run_cmd "Granting wheel (admin) privileges to '$uname'" usermod -aG wheel "$uname"
+            elif [[ "$role" == "user" && $in_wheel -eq 1 ]]; then
+                if [[ "$uname" == "root" ]]; then
+                    log_msg "WARN" "Skipping privilege removal on root."
+                else
+                    run_cmd "Removing wheel (admin) privileges from standard user '$uname'" gpasswd -d "$uname" wheel
+                fi
+            else
+                log_msg "OK" "User '$uname' privilege state matches roster ($role)."
+            fi
+        fi
+    done
+
+    # 2. Identify unauthorized human users (UID >= 1000) not in roster
+    log_msg "INFO" "Checking for existing UID >= 1000 accounts not listed in '$USER_ROSTER_FILE'..."
+    while IFS=: read -r sys_user _ sys_uid _ _ _ _; do
+        [[ "$sys_uid" -lt 1000 ]] && continue
+        [[ "$sys_user" == "nobody" || "$sys_user" == "nfsnobody" ]] && continue
+        if is_protected_account "$sys_user"; then
+            log_msg "INFO" "Skipping protected service/mail account '$sys_user' (UID $sys_uid)."
+            continue
+        fi
+
+        if [[ -z "${roster_role[$sys_user]+_}" ]]; then
+            log_msg "ALERT" "Unauthorized account detected (not in roster): '$sys_user' (UID $sys_uid)"
+            if [[ $DRY_RUN -eq 1 ]]; then
+                log_msg "DRYRUN" "Would prompt to lock or delete unauthorized account '$sys_user' (never deletes mailboxes automatically)."
+            else
+                echo "Select action for unauthorized user '$sys_user':"
+                echo "  [1] Do nothing (skip)"
+                echo "  [2] Lock password & remove from wheel (Safe - preserves mail & files)"
+                echo "  [3] Delete user account ONLY (Keep home & mail spool - requires confirmation)"
+                read -r -p "Choice [1-3, default 1]: " u_action
+                case "$u_action" in
+                    2)
+                        run_cmd "Locking account '$sys_user'" usermod -L "$sys_user"
+                        gpasswd -d "$sys_user" wheel 2>/dev/null || true
+                        ;;
+                    3)
+                        read -r -p "TYPE 'DELETE $sys_user' to confirm account deletion (files/mail retained): " confirm_del
+                        if [[ "$confirm_del" == "DELETE $sys_user" ]]; then
+                            backup_file /etc/passwd
+                            backup_file /etc/shadow
+                            backup_file /etc/group
+                            run_cmd "Deleting user account '$sys_user' (retaining home/mail)" userdel "$sys_user"
+                        else
+                            log_msg "INFO" "Deletion of '$sys_user' cancelled."
+                        fi
+                        ;;
+                    *)
+                        log_msg "INFO" "Skipped '$sys_user'."
+                        ;;
+                esac
+            fi
+        fi
+    done < /etc/passwd
+}
+
+# ==============================================================================
+# 7. MODULE B: PASSWORD MANAGEMENT
+# ==============================================================================
+manage_user_passwords() {
+    print_header "MODULE B: SECURE PASSWORD & AGING MANAGEMENT"
+    require_root || return 1
+
+    if [[ ! -f "$USER_ROSTER_FILE" ]]; then
+        log_msg "WARN" "Roster file '$USER_ROSTER_FILE' not found. Cannot batch-process roster users."
+        return 1
+    fi
+
+    echo "Select password input mode:"
+    echo "  [1] Read per-user credentials from a root-only (0600) file (Format: username:password)"
+    echo "  [2] Prompt interactively via hidden input (applied to all roster users)"
+    echo "  [3] Apply password aging policies ONLY (do not change passwords)"
+    echo "  [4] Apply hardcoded DEFAULT_COMP_PASSWORD to all roster users (Rapid Comp Mode)"
+    echo "  [0] Cancel"
+    read -r -p "Choice [0-4]: " pw_mode
+
+    case "$pw_mode" in
+        1)
+            read -r -p "Enter full path to 0600 credential file: " cred_file
+            if [[ ! -f "$cred_file" ]]; then
+                log_msg "ALERT" "Credential file '$cred_file' does not exist."
+                return 1
+            fi
+            local f_perm
+            f_perm="$(stat -c "%a" "$cred_file" 2>/dev/null)"
+            if [[ "$f_perm" != "600" && "$f_perm" != "400" ]]; then
+                log_msg "ALERT" "Credential file '$cred_file' permissions ($f_perm) are too permissive! Must be 600 or 400."
+                return 1
+            fi
+            if [[ $DRY_RUN -eq 1 ]]; then
+                log_msg "DRYRUN" "Would update passwords using 'chpasswd -c SHA512 < $cred_file'."
+            else
+                backup_file /etc/shadow
+                if chpasswd -c SHA512 < "$cred_file"; then
+                    log_msg "OK" "Passwords updated securely from '$cred_file'."
+                else
+                    log_msg "ALERT" "chpasswd reported an error processing '$cred_file'."
+                fi
+            fi
+            ;;
+        2)
+            local new_pass1 new_pass2
+            read -r -s -p "Enter new shared password for all roster users (hidden): " new_pass1
+            echo ""
+            read -r -s -p "Confirm new shared password (hidden): " new_pass2
+            echo ""
+            if [[ -z "$new_pass1" || "$new_pass1" != "$new_pass2" ]]; then
+                log_msg "ALERT" "Passwords do not match or are empty. Aborting."
+                unset new_pass1 new_pass2
+                return 1
+            fi
+
+            backup_file /etc/shadow
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line%%#*}"
+                line="$(echo "$line" | xargs)"
+                [[ -z "$line" ]] && continue
+                IFS=: read -r uname _ <<< "$line"
+                uname="$(echo "$uname" | xargs)"
+                if id "$uname" >/dev/null 2>&1 && ! is_protected_account "$uname"; then
+                    if [[ $DRY_RUN -eq 1 ]]; then
+                        log_msg "DRYRUN" "Would update password for '$uname' via stdin pipe to chpasswd."
+                    else
+                        printf '%s:%s\n' "$uname" "$new_pass1" | chpasswd -c SHA512
+                        log_msg "OK" "Updated password for '$uname'."
+                    fi
+                fi
+            done < "$USER_ROSTER_FILE"
+            unset new_pass1 new_pass2
+            ;;
+        3)
+            log_msg "INFO" "Proceeding to password aging configuration only."
+            ;;
+        4)
+            if [[ -z "${DEFAULT_COMP_PASSWORD:-}" ]]; then
+                log_msg "ALERT" "DEFAULT_COMP_PASSWORD is empty or unset!"
+                return 1
+            fi
+            backup_file /etc/shadow
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line%%#*}"
+                line="$(echo "$line" | xargs)"
+                [[ -z "$line" ]] && continue
+                IFS=: read -r uname _ <<< "$line"
+                uname="$(echo "$uname" | xargs)"
+                if id "$uname" >/dev/null 2>&1 && ! is_protected_account "$uname"; then
+                    if [[ $DRY_RUN -eq 1 ]]; then
+                        log_msg "DRYRUN" "Would set DEFAULT_COMP_PASSWORD for '$uname' and unlock account."
+                    else
+                        # Builtin printf pipes directly to chpasswd stdin (never visible in ps aux)
+                        printf '%s:%s\n' "$uname" "$DEFAULT_COMP_PASSWORD" | chpasswd -c SHA512
+                        # Also clear any pam_faillock or passwd lockouts for this user!
+                        passwd -u "$uname" >/dev/null 2>&1 || true
+                        faillock --user "$uname" --reset >/dev/null 2>&1 || true
+                        log_msg "OK" "Reset password and cleared lockouts for '$uname'."
+                    fi
+                fi
+            done < "$USER_ROSTER_FILE"
+            ;;
+        *)
+            log_msg "INFO" "Cancelled."
+            return 0
+            ;;
+    esac
+
+    # Apply conservative account aging to human users in roster
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="$(echo "$line" | xargs)"
+        [[ -z "$line" ]] && continue
+        IFS=: read -r uname _ <<< "$line"
+        uname="$(echo "$uname" | xargs)"
+        if id "$uname" >/dev/null 2>&1 && ! is_protected_account "$uname"; then
+            run_cmd "Setting password aging (min 1 day, max 90 days, warn 7 days) for '$uname'" chage -m 1 -M 90 -W 7 "$uname"
+        fi
+    done < "$USER_ROSTER_FILE"
+}
+
+# ==============================================================================
+# 8. MODULE C: PASSWORD AND AUTHENTICATION POLICIES (PAM / AUTHSELECT)
+# ==============================================================================
+audit_auth_policies() {
+    print_header "MODULE C: PASSWORD & AUTHENTICATION POLICY AUDIT (READ-ONLY)"
+
+    # 1. Check authselect status
+    if command -v authselect >/dev/null 2>&1; then
+        log_msg "INFO" "Checking Rocky Linux authselect profile:"
+        authselect current 2>&1 | sed 's/^/  /' | tee -a "$LOG_FILE"
+        if authselect check >/dev/null 2>&1; then
+            log_msg "OK" "authselect configuration integrity check passed."
+        else
+            log_msg "WARN" "authselect reports manual modifications or non-authselect PAM files!"
+        fi
+    else
+        log_msg "WARN" "authselect command not found."
+    fi
+
+    # 2. Audit /etc/security/pwquality.conf
+    if [[ -f /etc/security/pwquality.conf ]]; then
+        log_msg "INFO" "Active settings in /etc/security/pwquality.conf:"
+        grep -Ev '^[[:space:]]*(#|$)' /etc/security/pwquality.conf | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # 3. Audit /etc/security/faillock.conf
+    if [[ -f /etc/security/faillock.conf ]]; then
+        log_msg "INFO" "Active settings in /etc/security/faillock.conf:"
+        grep -Ev '^[[:space:]]*(#|$)' /etc/security/faillock.conf | sed 's/^/  /' | tee -a "$LOG_FILE"
+        if grep -Eq '^[[:space:]]*even_deny_root' /etc/security/faillock.conf; then
+            log_msg "ALERT" "'even_deny_root' is enabled in /etc/security/faillock.conf! Red Team can brute-force root and lock out administrators."
+        fi
+    fi
+
+    # 4. Audit /etc/login.defs
+    if [[ -f /etc/login.defs ]]; then
+        log_msg "INFO" "Key settings in /etc/login.defs:"
+        grep -E '^[[:space:]]*(PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_MIN_LEN|PASS_WARN_AGE|ENCRYPT_METHOD|UMASK|MAIL_DIR)' /etc/login.defs | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # 5. Check PAM files for rogue modules (pam_permit.so in auth, backdoors)
+    log_msg "INFO" "Auditing /etc/pam.d/ for suspicious 'pam_permit.so' in auth stacks or unexpected changes:"
+    grep -rn "pam_permit.so" /etc/pam.d/ 2>/dev/null | grep -E "auth[[:space:]]+" && \
+        log_msg "ALERT" "Review pam_permit.so usage in auth stacks above!" || \
+        log_msg "OK" "No suspicious auth pam_permit.so entries detected."
+
+    if command -v rpm >/dev/null 2>&1; then
+        local pam_verify
+        pam_verify="$(rpm -Vf /etc/pam.d/system-auth 2>/dev/null)"
+        [[ -n "$pam_verify" ]] && log_msg "INFO" "RPM verify on pam package: $pam_verify"
+    fi
+}
+
+harden_auth_policies() {
+    print_header "MODULE C: HARDEN PASSWORD & AUTHENTICATION POLICIES"
+    require_root || return 1
+
+    # 1. Harden /etc/security/pwquality.conf via drop-in or direct safe update
+    if [[ -f /etc/security/pwquality.conf ]]; then
+        backup_file /etc/security/pwquality.conf
+        local pwq_conf="/etc/security/pwquality.conf.d/99-ccdc-baseline.conf"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log_msg "DRYRUN" "Would write password complexity rules to $pwq_conf (minlen=14, dcredit=-1, ucredit=-1, lcredit=-1, ocredit=-1)"
+        else
+            mkdir -p /etc/security/pwquality.conf.d
+            cat << 'EOF' > "$pwq_conf"
+# CCDC Rocky Linux Password Quality Baseline
+minlen = 14
+dcredit = -1
+ucredit = -1
+lcredit = -1
+ocredit = -1
+minclass = 3
+maxrepeat = 3
+dictcheck = 1
+enforcing = 1
+retry = 3
+EOF
+            chmod 644 "$pwq_conf"
+            log_msg "OK" "Configured password complexity in $pwq_conf."
+        fi
+    fi
+
+    # 2. Harden /etc/security/pwhistory.conf (Rocky 9 / modern PAM)
+    if [[ -f /etc/security/pwhistory.conf ]]; then
+        backup_file /etc/security/pwhistory.conf
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log_msg "DRYRUN" "Would configure remember = 5 in /etc/security/pwhistory.conf"
+        else
+            sed -i 's/^[#[:space:]]*remember[[:space:]]*=.*/remember = 5/' /etc/security/pwhistory.conf
+            grep -Eq '^remember[[:space:]]*=' /etc/security/pwhistory.conf || echo "remember = 5" >> /etc/security/pwhistory.conf
+            log_msg "OK" "Configured password history (remember = 5) in /etc/security/pwhistory.conf."
+        fi
+    fi
+
+    # 3. Configure /etc/security/faillock.conf CONSERVATIVELY (Do NOT enable even_deny_root; moderate unlock time to prevent scoring DoS)
+    if [[ -f /etc/security/faillock.conf ]]; then
+        backup_file /etc/security/faillock.conf
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log_msg "DRYRUN" "Would configure conservative faillock settings in /etc/security/faillock.conf (deny=5, unlock_time=300, even_deny_root disabled)"
+        else
+            # Comment out even_deny_root if present so Red Team cannot lock out root
+            sed -i 's/^[[:space:]]*even_deny_root/# even_deny_root/' /etc/security/faillock.conf
+            grep -Eq '^deny[[:space:]]*=' /etc/security/faillock.conf && \
+                sed -i 's/^deny[[:space:]]*=.*/deny = 5/' /etc/security/faillock.conf || \
+                echo "deny = 5" >> /etc/security/faillock.conf
+            grep -Eq '^unlock_time[[:space:]]*=' /etc/security/faillock.conf && \
+                sed -i 's/^unlock_time[[:space:]]*=.*/unlock_time = 300/' /etc/security/faillock.conf || \
+                echo "unlock_time = 300" >> /etc/security/faillock.conf
+            log_msg "OK" "Configured /etc/security/faillock.conf (deny=5, unlock_time=300s, root lockout disabled)."
+        fi
+    fi
+
+    # 4. Safely update /etc/login.defs IN-PLACE (Preserve Rocky Linux MAIL_DIR /var/spool/mail)
+    if [[ -f /etc/login.defs ]]; then
+        backup_file /etc/login.defs
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log_msg "DRYRUN" "Would update PASS_MAX_DAYS (90), PASS_MIN_DAYS (1), PASS_WARN_AGE (7), and ENCRYPT_METHOD (SHA512) in /etc/login.defs"
+        else
+            sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t90/' /etc/login.defs
+            sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t1/' /etc/login.defs
+            sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE\t7/' /etc/login.defs
+            sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD\tSHA512/' /etc/login.defs
+            log_msg "OK" "Updated password aging defaults in /etc/login.defs while preserving Rocky Linux mail paths."
+        fi
+    fi
+
+    # 5. Enable authselect features safely if authselect is currently managing PAM
+    if command -v authselect >/dev/null 2>&1 && authselect check >/dev/null 2>&1; then
+        if authselect current >/dev/null 2>&1; then
+            run_cmd "Enabling authselect with-faillock feature" authselect enable-feature with-faillock
+            run_cmd "Applying authselect changes" authselect apply-changes
+        fi
+    else
+        log_msg "WARN" "Skipping automatic authselect modification because custom PAM configuration is active."
+    fi
+}
+
+# ==============================================================================
+# 9. MODULE D & E: NETWORK CONFIGURATION & SYSCTL KERNEL HARDENING
+# ==============================================================================
+audit_network_and_sysctl() {
+    print_header "MODULE D & E: NETWORK & SYSCTL AUDIT (READ-ONLY)"
+    detect_mail_stack
+
+    log_msg "INFO" "--- Active Network Interfaces & Addresses ---"
+    ip -brief addr show | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    log_msg "INFO" "--- Routing Table ---"
+    ip route show | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    log_msg "INFO" "--- Key Kernel & Network Sysctl Values ---"
+    local keys=(
+        "net.ipv4.ip_forward"
+        "net.ipv4.conf.all.accept_Source_route"
+        "net.ipv4.conf.all.accept_redirects"
+        "net.ipv4.conf.all.send_redirects"
+        "net.ipv4.conf.all.rp_filter"
+        "net.ipv4.tcp_syncookies"
+        "net.ipv4.icmp_echo_ignore_all"
+        "net.ipv4.icmp_echo_ignore_broadcasts"
+        "net.ipv6.conf.all.disable_ipv6"
+        "net.ipv6.conf.all.accept_redirects"
+        "net.ipv6.conf.all.forwarding"
+        "kernel.randomize_va_space"
+        "kernel.kptr_restrict"
+        "kernel.dmesg_restrict"
+        "kernel.unprivileged_bpf_disabled"
+        "kernel.sysrq"
+        "fs.suid_dumpable"
+        "fs.protected_hardlinks"
+        "fs.protected_symlinks"
+        "crypto.fips_enabled"
+    )
+
+    for k in "${keys[@]}"; do
+        local val
+        val="$(sysctl -n "$k" 2>/dev/null || echo "N/A")"
+        printf "  %-45s = %s\n" "$k" "$val" | tee -a "$LOG_FILE"
+    done
+
+    # Check for conflicting sysctl files
+    log_msg "INFO" "--- Existing Sysctl Configuration Files ---"
+    ls -la /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+}
+
+harden_sysctl() {
+    print_header "MODULE D & E: SYSCTL & KERNEL HARDENING"
+    require_root || return 1
+    detect_mail_stack
+
+    backup_file "$SYSCTL_DROPIN"
+
+    # Determine safe IPv6 sysctl posture
+    local disable_ipv6_val=0
+    if [[ $IPV6_REQUIRED -eq 1 ]]; then
+        log_msg "INFO" "Mail server or system requires IPv6. Keeping IPv6 enabled and hardening IPv6 stack."
+        disable_ipv6_val=0
+    else
+        log_msg "INFO" "Keeping IPv6 enabled on loopback/interfaces by default to prevent Postfix/Dovecot socket bind failures, while hardening IPv6 redirects/RA."
+        disable_ipv6_val=0
+    fi
+
+    local tmp_sysctl="/tmp/ccdc_sysctl_${TIMESTAMP}.conf"
+    cat << EOF > "$tmp_sysctl"
+# ==============================================================================
+# CCDC Rocky Linux Mail Server Sysctl Hardening Baseline
+# Generated: ${TIMESTAMP}
+# ==============================================================================
+
+# --- Kernel Security & Memory Protection ---
+kernel.randomize_va_space = 2
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.sysrq = 0
+kernel.core_uses_pid = 1
+kernel.kexec_load_disabled = 1
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+kernel.perf_event_paranoid = 2
+kernel.yama.ptrace_scope = 1
+
+# --- Filesystem & Core Dump Restrictions ---
+fs.suid_dumpable = 0
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
+dev.tty.ldisc_autoload = 0
+
+# --- IPv4 Network Stack Hardening ---
+net.ipv4.ip_forward = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+
+# --- ICMP Behavior (Preserve Ping for CCDC Scoring Checks!) ---
+net.ipv4.icmp_echo_ignore_all = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# --- IPv6 Network Stack Hardening (Mail-Safe) ---
+net.ipv6.conf.all.disable_ipv6 = ${disable_ipv6_val}
+net.ipv6.conf.default.disable_ipv6 = ${disable_ipv6_val}
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
+EOF
+
+    # Filter out any sysctl keys not supported by the running kernel to guarantee clean validation
+    local validated_tmp="/tmp/ccdc_sysctl_valid_${TIMESTAMP}.conf"
+    : > "$validated_tmp"
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]]; then
+            echo "$line" >> "$validated_tmp"
+            continue
+        fi
+        local key="${line%%=*}"
+        key="$(echo "$key" | xargs)"
+        local proc_path="/proc/sys/${key//./\/}"
+        if [[ -e "$proc_path" ]]; then
+            echo "$line" >> "$validated_tmp"
+        else
+            log_msg "WARN" "Skipping unsupported kernel sysctl key on this kernel: $key"
+        fi
+    done < "$tmp_sysctl"
+    rm -f "$tmp_sysctl"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_msg "DRYRUN" "Validated sysctl configuration. Would install to '$SYSCTL_DROPIN' and run 'sysctl --system'."
+        rm -f "$validated_tmp"
+    else
+        mv "$validated_tmp" "$SYSCTL_DROPIN"
+        chmod 644 "$SYSCTL_DROPIN"
+        chown root:root "$SYSCTL_DROPIN"
+        restorecon "$SYSCTL_DROPIN" 2>/dev/null || true
+        if sysctl -p "$SYSCTL_DROPIN" >/dev/null; then
+            log_msg "OK" "Applied sysctl baseline from '$SYSCTL_DROPIN'."
+        else
+            log_msg "WARN" "Some sysctl keys returned warnings when applying '$SYSCTL_DROPIN'."
+        fi
+    fi
+}
+
+# ==============================================================================
+# 10. MODULE F: SSH AND SSHD
+# ==============================================================================
+audit_sshd() {
+    print_header "MODULE F: SSH & SSHD CONFIGURATION AUDIT (READ-ONLY)"
+
+    if systemctl is-active --quiet sshd 2>/dev/null; then
+        log_msg "OK" "sshd service is active and running."
+    else
+        log_msg "WARN" "sshd service is NOT running!"
+    fi
+
+    if command -v sshd >/dev/null 2>&1; then
+        log_msg "INFO" "Effective sshd configuration (via sshd -T):"
+        sshd -T 2>/dev/null | grep -E "^(port|permitrootlogin|passwordauthentication|pubkeyauthentication|permitemptypasswords|maxauthtries|logingracetime|clientaliveinterval|clientalivecountmax|allowusers|allowgroups|denyusers|denygroups|usepam|x11forwarding|authorizedkeysfile)" | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # Check /etc/ssh/sshd_config.d/ drop-ins (Rocky Linux 9 uses drop-ins extensively!)
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        log_msg "INFO" "Inspecting /etc/ssh/sshd_config.d/ drop-in files:"
+        ls -la /etc/ssh/sshd_config.d/ | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # Audit authorized_keys across users for Red Team persistence
+    log_msg "INFO" "Auditing SSH authorized_keys files across all accounts:"
+    while IFS=: read -r uname _ _ _ _ homedir _; do
+        if [[ -d "$homedir/.ssh" ]]; then
+            for kf in "$homedir/.ssh/authorized_keys" "$homedir/.ssh/authorized_keys2"; do
+                if [[ -f "$kf" && -s "$kf" ]]; then
+                    local count
+                    count="$(grep -Ev '^[[:space:]]*(#|$)' "$kf" | wc -l)"
+                    log_msg "WARN" "User '$uname' has $count key(s) in $kf"
+                fi
+            done
+        fi
+    done < /etc/passwd
+}
+
+harden_sshd() {
+    print_header "MODULE F: HARDEN SSHD CONFIGURATION"
+    require_root || return 1
+
+    local sshd_main="/etc/ssh/sshd_config"
+    if [[ ! -f "$sshd_main" ]]; then
+        log_msg "ALERT" "$sshd_main not found!"
+        return 1
+    fi
+
+    backup_file "$sshd_main"
+
+    # Never disable PasswordAuthentication automatically in CCDC unless verified, as scoring engines often use SSH password auth
+    local tmp_sshd="/tmp/sshd_config.${TIMESTAMP}"
+    cp -a "$sshd_main" "$tmp_sshd"
+
+    declare -A ssh_settings=(
+        ["PermitRootLogin"]="no"
+        ["PubkeyAuthentication"]="yes"
+        ["PasswordAuthentication"]="yes"
+        ["PermitEmptyPasswords"]="no"
+        ["MaxAuthTries"]="4"
+        ["LoginGraceTime"]="60"
+        ["ClientAliveInterval"]="300"
+        ["ClientAliveCountMax"]="2"
+        ["X11Forwarding"]="no"
+        ["UsePAM"]="yes"
+    )
+
+    for key in "${!ssh_settings[@]}"; do
+        local val="${ssh_settings[$key]}"
+        if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$tmp_sshd"; then
+            sed -i -E "s/^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*/${key} ${val}/" "$tmp_sshd"
+        else
+            echo "${key} ${val}" >> "$tmp_sshd"
+        fi
+    done
+
+    # Validate candidate config with sshd -t BEFORE touching live file
+    if ! sshd -t -f "$tmp_sshd" 2>/dev/null; then
+        log_msg "ALERT" "Candidate sshd_config failed 'sshd -t' validation! Aborting SSHD changes."
+        rm -f "$tmp_sshd"
+        return 1
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_msg "DRYRUN" "Candidate sshd_config passed 'sshd -t' validation. Would update $sshd_main and reload sshd."
+        rm -f "$tmp_sshd"
+    else
+        mv "$tmp_sshd" "$sshd_main"
+        chown root:root "$sshd_main"
+        chmod 600 "$sshd_main"
+        restorecon "$sshd_main" 2>/dev/null || true
+        run_cmd "Reloading sshd service safely" systemctl reload sshd
+        log_msg "OK" "SSHD hardened and reloaded (PasswordAuthentication preserved for CCDC scoring)."
+    fi
+}
+
+# ==============================================================================
+# 11. MODULE G: FTP AUDIT
+# ==============================================================================
+audit_ftp() {
+    print_header "MODULE G: FTP SERVICES & CONFIGURATION AUDIT (READ-ONLY)"
+
+    local ftp_pkgs=("vsftpd" "proftpd" "pure-ftpd" "tftp-server")
+    local found_ftp=0
+
+    for pkg in "${ftp_pkgs[@]}"; do
+        if rpm -q "$pkg" >/dev/null 2>&1; then
+            found_ftp=1
+            log_msg "WARN" "FTP package installed: $pkg"
+            local st
+            st="$(systemctl is-active "$pkg" 2>/dev/null || echo "inactive")"
+            log_msg "INFO" "Service '$pkg' status: $st"
+        fi
+    done
+
+    if [[ $found_ftp -eq 0 ]]; then
+        log_msg "OK" "No FTP server packages (vsftpd, proftpd, pure-ftpd, tftp-server) are installed."
+    fi
+
+    # Check Rocky Linux vsftpd path (/etc/vsftpd/vsftpd.conf) and fallback (/etc/vsftpd.conf)
+    for vconf in /etc/vsftpd/vsftpd.conf /etc/vsftpd.conf; do
+        if [[ -f "$vconf" ]]; then
+            log_msg "INFO" "Inspecting $vconf:"
+            grep -Ev '^[[:space:]]*(#|$)' "$vconf" | sed 's/^/  /' | tee -a "$LOG_FILE"
+            if grep -Eq '^[[:space:]]*anonymous_enable[[:space:]]*=[[:space:]]*YES' "$vconf"; then
+                log_msg "ALERT" "Anonymous FTP login is ENABLED in $vconf!"
+            fi
+            if grep -Eq '^[[:space:]]*write_enable[[:space:]]*=[[:space:]]*YES' "$vconf"; then
+                log_msg "WARN" "FTP write_enable=YES in $vconf."
+            fi
+        fi
+    done
+}
+
+# ==============================================================================
+# 12. MODULE H: CORE SYSTEM AND /etc SECURITY
+# ==============================================================================
+audit_and_harden_etc_permissions() {
+    local mode="${1:-audit}" # 'audit' or 'harden'
+    print_header "MODULE H: CORE SYSTEM & /etc SECURITY (${mode^^})"
+
+    # Expected file permissions on Rocky Linux: path|octal_mode|owner:group
+    # NOTE: Rocky Linux /etc/shadow and /etc/gshadow MUST be 0000 root:root
+    local baseline_specs=(
+        "/etc|755|root:root"
+        "/etc/passwd|644|root:root"
+        "/etc/group|644|root:root"
+        "/etc/shadow|0|root:root"
+        "/etc/gshadow|0|root:root"
+        "/etc/passwd-|644|root:root"
+        "/etc/group-|644|root:root"
+        "/etc/shadow-|0|root:root"
+        "/etc/gshadow-|0|root:root"
+        "/etc/sudoers|440|root:root"
+        "/etc/sudoers.d|750|root:root"
+        "/etc/security|755|root:root"
+        "/etc/ssh|755|root:root"
+        "/etc/ssh/sshd_config|600|root:root"
+        "/etc/pam.d|755|root:root"
+        "/etc/sysctl.conf|644|root:root"
+        "/etc/sysctl.d|755|root:root"
+        "/etc/systemd|755|root:root"
+        "/etc/crontab|600|root:root"
+        "/etc/cron.d|700|root:root"
+        "/etc/cron.daily|700|root:root"
+        "/etc/cron.hourly|700|root:root"
+        "/etc/cron.weekly|700|root:root"
+        "/etc/cron.monthly|700|root:root"
+        "/tmp|1777|root:root"
+        "/var/tmp|1777|root:root"
+    )
+
+    for spec in "${baseline_specs[@]}"; do
+        IFS='|' read -r fpath exp_perm exp_own <<< "$spec"
+        [[ ! -e "$fpath" ]] && continue
+
+        local cur_perm cur_own
+        cur_perm="$(stat -c "%a" "$fpath" 2>/dev/null)"
+        cur_own="$(stat -c "%U:%G" "$fpath" 2>/dev/null)"
+
+        if [[ "$cur_perm" != "$exp_perm" || "$cur_own" != "$exp_own" ]]; then
+            log_msg "WARN" "$fpath -> Current: $cur_perm ($cur_own) | Expected: $exp_perm ($exp_own)"
+            if [[ "$mode" == "harden" ]]; then
+                require_root || return 1
+                # Remove immutable attribute if set on critical auth files before fixing perms
+                chattr -ia "$fpath" 2>/dev/null || true
+                run_cmd "Setting ownership $exp_own on $fpath" chown "$exp_own" "$fpath"
+                run_cmd "Setting permissions 0$exp_perm on $fpath" chmod "0$exp_perm" "$fpath"
+                restorecon "$fpath" 2>/dev/null || true
+            fi
+        else
+            log_msg "OK" "$fpath matches baseline ($cur_perm $cur_own)."
+        fi
+    done
+
+    # Check for world-writable files inside /etc
+    log_msg "INFO" "Checking for world-writable files or directories in /etc:"
+    local ww_etc
+    ww_etc="$(find /etc -xdev \( -type f -o -type d \) -perm -0002 2>/dev/null)"
+    if [[ -n "$ww_etc" ]]; then
+        log_msg "ALERT" "World-writable items found in /etc:"
+        echo "$ww_etc" | sed 's/^/  /' | tee -a "$LOG_FILE"
+    else
+        log_msg "OK" "No world-writable files or directories in /etc."
+    fi
+
+    # Check SUID/SGID binaries in standard binary paths (Fast, bounded search)
+    log_msg "INFO" "Auditing SUID/SGID binaries in /bin, /sbin, /usr/bin, /usr/sbin, /usr/local:"
+    find /bin /sbin /usr/bin /usr/sbin /usr/local -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec ls -la {} + 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    # Check immutable files in /etc
+    if command -v lsattr >/dev/null 2>&1; then
+        log_msg "INFO" "Checking for immutable (+i) or append-only (+a) files in /etc:"
+        lsattr -R /etc 2>/dev/null | grep -E '^[a-zA-Z-]{4}[ia]' | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+}
+
+audit_and_harden_sudoers() {
+    local mode="${1:-audit}"
+    print_header "SUDOERS CONFIGURATION (${mode^^})"
+
+    if [[ -d /etc/sudoers.d ]]; then
+        log_msg "INFO" "Inspecting /etc/sudoers and /etc/sudoers.d/ for NOPASSWD or suspicious rules:"
+        grep -rnE '^[^#].*(ALL|NOPASSWD|!authenticate)' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    if [[ "$mode" == "harden" ]]; then
+        require_root || return 1
+        backup_file "$SUDOERS_DROPIN"
+        local tmp_sudo="/tmp/ccdc_sudoers_${TIMESTAMP}"
+        cat << 'EOF' > "$tmp_sudo"
+# CCDC Rocky Linux Safe Sudoers Baseline Drop-in
+Defaults use_pty
+Defaults logfile="/var/log/sudo.log"
+Defaults passwd_tries=3
+Defaults timestamp_timeout=15
+%wheel ALL=(ALL) ALL
+EOF
+        chmod 440 "$tmp_sudo"
+        if visudo -cf "$tmp_sudo" >/dev/null 2>&1; then
+            if [[ $DRY_RUN -eq 1 ]]; then
+                log_msg "DRYRUN" "Validated sudoers drop-in via 'visudo -cf'. Would install to $SUDOERS_DROPIN."
+                rm -f "$tmp_sudo"
+            else
+                mv "$tmp_sudo" "$SUDOERS_DROPIN"
+                chown root:root "$SUDOERS_DROPIN"
+                chmod 440 "$SUDOERS_DROPIN"
+                restorecon "$SUDOERS_DROPIN" 2>/dev/null || true
+                log_msg "OK" "Installed validated sudoers baseline at $SUDOERS_DROPIN."
+            fi
+        else
+            log_msg "ALERT" "visudo validation failed on $tmp_sudo! Aborting."
+            rm -f "$tmp_sudo"
+            return 1
+        fi
+    fi
+}
+
+# ==============================================================================
+# 13. MODULE I & U: REPOSITORY, PACKAGE MANAGEMENT & AUTOMATIC UPDATES
+# ==============================================================================
+audit_packages_and_repos() {
+    print_header "MODULE I & U: DNF REPOSITORIES, PACKAGES & AUTO-UPDATES AUDIT (READ-ONLY)"
+
+    log_msg "INFO" "Inspecting /etc/yum.repos.d/ repository files and GPG checks:"
+    for repo in /etc/yum.repos.d/*.repo; do
+        [[ ! -f "$repo" ]] && continue
+        log_msg "INFO" "Repo file: $repo"
+        if grep -Eq '^[[:space:]]*gpgcheck[[:space:]]*=[[:space:]]*0' "$repo"; then
+            log_msg "ALERT" "gpgcheck=0 found in $repo!"
+        fi
+    done
+
+    # Check for suspicious offensive/backdoor packages installed via RPM
+    local suspect_pkgs=(
+        "nmap-ncat" "nc" "socat" "hydra" "john" "hashcat" "wireshark" "tcpdump"
+        "nikto" "sqlmap" "aircrack-ng" "ettercap" "metasploit" "telnet-server"
+        "rsh-server" "tftp-server" "xinetd" "tigervnc-server"
+    )
+    log_msg "INFO" "Checking for potentially unwanted or dual-use packages:"
+    for pkg in "${suspect_pkgs[@]}"; do
+        if rpm -q "$pkg" >/dev/null 2>&1; then
+            log_msg "WARN" "Installed package requires review: $pkg"
+        fi
+    done
+
+    # Check dnf-automatic status (Module U)
+    log_msg "INFO" "--- Automatic Updates Status (dnf-automatic) ---"
+    if rpm -q dnf-automatic >/dev/null 2>&1; then
+        log_msg "INFO" "dnf-automatic is installed."
+        systemctl list-timers 'dnf-automatic*' --no-pager 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+    else
+        log_msg "INFO" "dnf-automatic is not installed (manual update control active)."
+    fi
+}
+
+update_all_applications() {
+    print_header "MODULE I: DNF PACKAGE UPDATE (MAINTENANCE)"
+    require_root || return 1
+
+    log_msg "INFO" "Checking available DNF updates (read-only preview)..."
+    dnf check-update
+    local rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        log_msg "OK" "All installed packages are up to date."
+        return 0
+    elif [[ $rc -ne 100 ]]; then
+        log_msg "ALERT" "dnf check-update failed with exit code $rc. Check network/DNS or repo config."
+        return 1
+    fi
+
+    log_msg "WARN" "Updates are available (exit code 100)."
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_msg "DRYRUN" "Dry-Run enabled. Would prompt before running 'dnf upgrade --nobest --setopt=install_weak_deps=False' without rebooting."
+        return 0
+    fi
+
+    read -r -p "Proceed with applying DNF package updates now? (Never auto-reboots) (y/N): " confirm_upd
+    if [[ "$confirm_upd" =~ ^[Yy]$ ]]; then
+        if dnf upgrade -y --nobest; then
+            log_msg "OK" "DNF package updates completed successfully. System was NOT rebooted."
+        else
+            log_msg "ALERT" "DNF package upgrade encountered errors! Review $LOG_FILE."
+            return 1
+        fi
+    else
+        log_msg "INFO" "Package update skipped by administrator."
+    fi
+}
+
+# ==============================================================================
+# 14. MODULE J: LIGHTWEIGHT MALWARE AND ROOTKIT AUDITING
+# ==============================================================================
+audit_malware_lightweight() {
+    print_header "MODULE J: LIGHTWEIGHT MALWARE & INTEGRITY AUDIT (READ-ONLY)"
+
+    # 1. Check /dev/shm, /tmp, /var/tmp for executable files or scripts
+    log_msg "INFO" "Scanning /dev/shm, /tmp, and /var/tmp for executable files or hidden items:"
+    find /dev/shm /tmp /var/tmp -xdev \( -type f -perm /111 -o -name ".*" \) 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    # 2. Check /etc/ld.so.preload (classic userland rootkit hook)
+    if [[ -f /etc/ld.so.preload && -s /etc/ld.so.preload ]]; then
+        log_msg "ALERT" "/etc/ld.so.preload exists and is non-empty! Contents:"
+        cat /etc/ld.so.preload | sed 's/^/  /' | tee -a "$LOG_FILE"
+    else
+        log_msg "OK" "/etc/ld.so.preload is absent or empty."
+    fi
+
+    # 3. Check binary file capabilities (getcap) in system binary directories
+    if command -v getcap >/dev/null 2>&1; then
+        log_msg "INFO" "Checking file capabilities in /usr/bin, /usr/sbin, /usr/local, /home, /tmp:"
+        getcap -r /usr/bin /usr/sbin /usr/local /home /tmp 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # 4. Targeted RPM integrity check on critical authentication & network packages (Fast, takes ~2 seconds)
+    log_msg "INFO" "Running targeted RPM integrity check (rpm -V) on core security packages:"
+    local core_rpms=("openssh-server" "openssh-clients" "pam" "sudo" "shadow-utils" "systemd" "util-linux" "coreutils" "iproute" "procps-ng" "postfix" "dovecot")
+    for pkg in "${core_rpms[@]}"; do
+        if rpm -q "$pkg" >/dev/null 2>&1; then
+            local v_out
+            v_out="$(rpm -V "$pkg" 2>/dev/null | grep -Ev ' c ')" # Ignore normal config file edits (' c ')
+            if [[ -n "$v_out" ]]; then
+                log_msg "ALERT" "Binary/File integrity anomaly in package '$pkg':"
+                echo "$v_out" | sed 's/^/  /' | tee -a "$LOG_FILE"
+            fi
+        fi
+    done
+
+    # 5. Check optional installed scanners (Do not run heavy scans automatically)
+    for tool in rkhunter chkrootkit clamscan aide; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            log_msg "INFO" "Optional security tool '$tool' is INSTALLED."
+        else
+            log_msg "INFO" "Optional security tool '$tool' is NOT installed."
+        fi
+    done
+}
+
+# ==============================================================================
+# 15. MODULE K: POLKIT AUDIT
+# ==============================================================================
+audit_polkit() {
+    print_header "MODULE K: POLKIT AUTHORIZATION RULES AUDIT (READ-ONLY)"
+
+    local polkit_dirs=("/etc/polkit-1/rules.d" "/etc/polkit-1/localauthority" "/usr/share/polkit-1/rules.d")
+    for pdir in "${polkit_dirs[@]}"; do
+        if [[ -d "$pdir" ]]; then
+            log_msg "INFO" "Listing Polkit directory: $pdir"
+            ls -la "$pdir" 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+            # Check for world/group writable rules
+            local writable_rules
+            writable_rules="$(find "$pdir" -type f -perm /022 2>/dev/null)"
+            if [[ -n "$writable_rules" ]]; then
+                log_msg "ALERT" "Group/World-writable Polkit files found in $pdir: $writable_rules"
+            fi
+
+            # Search for unconditional YES returns in custom /etc rules
+            if [[ "$pdir" == /etc/* ]]; then
+                grep -rnE "polkit\.Result\.YES|NOPASSWD" "$pdir" 2>/dev/null | sed 's/^/  [RULE MATCH] /' | tee -a "$LOG_FILE"
+            fi
+        fi
+    done
+}
+
+# ==============================================================================
+# 16. MODULE L: CRON AND SCHEDULED TASKS AUDIT
+# ==============================================================================
+audit_scheduled_tasks() {
+    print_header "MODULE L: CRON, AT & SYSTEMD TIMERS AUDIT (READ-ONLY)"
+
+    # 1. System crontabs
+    local cron_paths=("/etc/crontab" "/etc/anacrontab" "/etc/cron.d" "/etc/cron.hourly" "/etc/cron.daily" "/etc/cron.weekly" "/etc/cron.monthly" "/var/spool/cron")
+    for cp in "${cron_paths[@]}"; do
+        if [[ -f "$cp" ]]; then
+            log_msg "INFO" "Contents of $cp:"
+            grep -Ev '^[[:space:]]*(#|$)' "$cp" | sed 's/^/  /' | tee -a "$LOG_FILE"
+        elif [[ -d "$cp" ]]; then
+            log_msg "INFO" "Files in $cp:"
+            ls -la "$cp" 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+            for f in "$cp"/*; do
+                [[ -f "$f" ]] || continue
+                log_msg "INFO" "--- Task File: $f ---"
+                grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null | head -n 30 | sed 's/^/    /' | tee -a "$LOG_FILE"
+            done
+        fi
+    done
+
+    # 2. Check at jobs (/var/spool/at on Rocky Linux)
+    if [[ -d /var/spool/at ]]; then
+        log_msg "INFO" "Checking /var/spool/at jobs:"
+        find /var/spool/at -maxdepth 1 -type f ! -name ".SEQ" -ls 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # 3. Systemd Timers
+    log_msg "INFO" "Active & Enabled Systemd Timers:"
+    systemctl list-timers --all --no-pager 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+}
+
+# ==============================================================================
+# 17. MODULE M: DISPLAY MANAGER AND GSETTINGS (GDM / GNOME)
+# ==============================================================================
+audit_display_manager() {
+    print_header "MODULE M: DISPLAY MANAGER & GNOME AUDIT (READ-ONLY)"
+
+    if ! rpm -q gdm >/dev/null 2>&1 && [[ ! -d /etc/gdm ]]; then
+        log_msg "OK" "No graphical Display Manager (GDM) is installed (Headless Mail Server)."
+        return 0
+    fi
+
+    log_msg "WARN" "GDM graphical display manager is installed on this mail server!"
+    log_msg "INFO" "Current default systemd target: $(systemctl get-default 2>/dev/null)"
+
+    if [[ -f /etc/gdm/custom.conf ]]; then
+        log_msg "INFO" "Contents of /etc/gdm/custom.conf:"
+        grep -Ev '^[[:space:]]*(#|$)' /etc/gdm/custom.conf | sed 's/^/  /' | tee -a "$LOG_FILE"
+        if grep -Eqi '^[[:space:]]*AutomaticLoginEnable[[:space:]]*=[[:space:]]*(true|1)' /etc/gdm/custom.conf; then
+            log_msg "ALERT" "GDM AutomaticLoginEnable is enabled in /etc/gdm/custom.conf!"
+        fi
+    fi
+
+    if [[ -d /etc/dconf/db ]]; then
+        log_msg "INFO" "Inspecting /etc/dconf/db locks & policies:"
+        find /etc/dconf/db -type f -ls 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+}
+
+# ==============================================================================
+# 18. MODULE N: GRUB AND BOOTLOADER AUDIT
+# ==============================================================================
+audit_grub_and_banners() {
+    local mode="${1:-audit}"
+    print_header "MODULE N: GRUB BOOTLOADER & BANNERS (${mode^^})"
+
+    # 1. Check /etc/default/grub
+    if [[ -f /etc/default/grub ]]; then
+        log_msg "INFO" "Contents of /etc/default/grub:"
+        cat /etc/default/grub | sed 's/^/  /' | tee -a "$LOG_FILE"
+        if grep -Eq "selinux=0|enforcing=0" /etc/default/grub; then
+            log_msg "ALERT" "SELinux is disabled or set to permissive on kernel command line in /etc/default/grub!"
+        fi
+    fi
+
+    # 2. Check live kernel command line
+    log_msg "INFO" "Live /proc/cmdline: $(cat /proc/cmdline 2>/dev/null)"
+
+    # 3. Check GRUB2 configuration file permissions (Rocky BIOS & EFI paths)
+    local grub_files=("/boot/grub2/grub.cfg" "/boot/grub2/user.cfg" "/boot/efi/EFI/rocky/grub.cfg" "/boot/efi/EFI/rocky/user.cfg")
+    for gf in "${grub_files[@]}"; do
+        if [[ -f "$gf" ]]; then
+            local g_stat
+            g_stat="$(stat -c "%a %U:%G" "$gf" 2>/dev/null)"
+            log_msg "INFO" "Bootloader file $gf -> Permissions: $g_stat"
+            if [[ "$mode" == "harden" ]]; then
+                require_root || return 1
+                run_cmd "Securing permissions (0600 root:root) on $gf" chmod 600 "$gf"
+                run_cmd "Setting owner root:root on $gf" chown root:root "$gf"
+            fi
+        fi
+    done
+
+    # 4. Legal Banners (/etc/issue, /etc/issue.net)
+    if [[ "$mode" == "harden" ]]; then
+        require_root || return 1
+        for bfile in /etc/issue /etc/issue.net; do
+            backup_file "$bfile"
+            if [[ $DRY_RUN -eq 1 ]]; then
+                log_msg "DRYRUN" "Would set warning banner in $bfile (0644 root:root)"
+            else
+                echo "Authorized uses only. All activity may be monitored and reported." > "$bfile"
+                chown root:root "$bfile"
+                chmod 644 "$bfile"
+                log_msg "OK" "Updated login warning banner in $bfile."
+            fi
+        done
+    fi
+}
+
+# ==============================================================================
+# 19. MODULE O, P & R: SERVICES, PORTS, AND SYSTEMD AUDIT
+# ==============================================================================
+audit_services_and_systemd() {
+    print_header "MODULE O & R: SYSTEMD SERVICES & UNIT FILES AUDIT (READ-ONLY)"
+    detect_mail_stack
+
+    log_msg "INFO" "--- Active Running Services ---"
+    systemctl list-units --type=service --state=running --no-pager 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    log_msg "INFO" "--- Failed Services ---"
+    systemctl list-units --type=service --state=failed --no-pager 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    # Check for custom or overridden systemd unit files in /etc/systemd/system and /run/systemd/system
+    log_msg "INFO" "--- Custom Unit Files & Drop-in Overrides in /etc/systemd/system ---"
+    find /etc/systemd/system -maxdepth 2 \( -type f -o -type d \) ! -name "*.wants" 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    # Check for world-writable systemd service unit files
+    log_msg "INFO" "--- Checking for World-Writable Systemd Unit Files ---"
+    local ww_units
+    ww_units="$(find /etc/systemd/system /usr/lib/systemd/system -type f -perm -0002 2>/dev/null)"
+    if [[ -n "$ww_units" ]]; then
+        log_msg "ALERT" "World-writable systemd unit files found: $ww_units"
+    else
+        log_msg "OK" "No world-writable systemd unit files detected."
+    fi
+}
+
+audit_listening_ports() {
+    print_header "MODULE P: LISTENING NETWORK SOCKETS AUDIT (READ-ONLY)"
+
+    log_msg "INFO" "--- Listening TCP Sockets (ss -tlnp) ---"
+    ss -tlnp 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+
+    log_msg "INFO" "--- Listening UDP Sockets (ss -ulnp) ---"
+    ss -ulnp 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+}
+
+# ==============================================================================
+# 20. MODULE Q: FIREWALL (FIREWALLD)
+# ==============================================================================
+audit_firewall() {
+    print_header "MODULE Q: FIREWALLD & NFTABLES AUDIT (READ-ONLY)"
+    detect_mail_stack
+
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        log_msg "OK" "firewalld service is active."
+        log_msg "INFO" "Default Zone: $(firewall-cmd --get-default-zone 2>/dev/null)"
+        log_msg "INFO" "Active Zones & Interfaces:"
+        firewall-cmd --get-active-zones 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+        log_msg "INFO" "Runtime Configuration (--list-all):"
+        firewall-cmd --list-all 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+        log_msg "INFO" "Permanent Configuration (--list-all --permanent):"
+        firewall-cmd --list-all --permanent 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+    else
+        log_msg "WARN" "firewalld is NOT active! Checking raw nftables/iptables ruleset:"
+        nft list ruleset 2>/dev/null | head -n 40 | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+}
+
+harden_firewall() {
+    print_header "MODULE Q: CONFIGURE FIREWALLD (MAIL-SERVER SAFE)"
+    require_root || return 1
+    detect_mail_stack
+
+    if ! command -v firewall-cmd >/dev/null 2>&1; then
+        log_msg "ALERT" "firewall-cmd is not installed. Cannot configure firewalld."
+        return 1
+    fi
+
+    # Start and enable firewalld if not running
+    if ! systemctl is-active --quiet firewalld 2>/dev/null; then
+        run_cmd "Enabling and starting firewalld" systemctl enable --now firewalld
+    fi
+
+    # 1. Always permit SSH so remote administration and SSH scoring never drop
+    run_cmd "Permitting SSH service in firewalld (runtime)" firewall-cmd --add-service=ssh
+    run_cmd "Permitting SSH service in firewalld (permanent)" firewall-cmd --permanent --add-service=ssh
+
+    # 2. Permit ONLY the mail ports that are actively listening on this server
+    if [[ ${#ACTIVE_MAIL_PORTS[@]} -gt 0 ]]; then
+        for mport in "${ACTIVE_MAIL_PORTS[@]}"; do
+            run_cmd "Permitting active mail TCP port ${mport}/tcp (runtime)" firewall-cmd --add-port="${mport}/tcp"
+            run_cmd "Permitting active mail TCP port ${mport}/tcp (permanent)" firewall-cmd --permanent --add-port="${mport}/tcp"
+        done
+    else
+        log_msg "WARN" "No active listening mail ports were detected via ss! Review firewall rules manually if mail services are currently stopped."
+    fi
+
+    # 3. If webmail (httpd/nginx) is active, preserve HTTP/HTTPS
+    if systemctl is-active --quiet httpd 2>/dev/null || systemctl is-active --quiet nginx 2>/dev/null; then
+        log_msg "INFO" "Active web server detected (likely Webmail). Preserving HTTP/HTTPS in firewalld."
+        run_cmd "Permitting HTTP/HTTPS (runtime)" firewall-cmd --add-service=http --add-service=https
+        run_cmd "Permitting HTTP/HTTPS (permanent)" firewall-cmd --permanent --add-service=http --add-service=https
+    fi
+
+    log_msg "OK" "Firewalld updated safely without disrupting SSH or active mail ports."
+}
+
+# ==============================================================================
+# 21. MODULE S: LOGGING AUDIT AND BASELINE
+# ==============================================================================
+audit_and_harden_logging() {
+    local mode="${1:-audit}"
+    print_header "MODULE S: SYSTEM & MAIL LOGGING (${mode^^})"
+
+    for lsvc in systemd-journald rsyslog auditd; do
+        local st
+        st="$(systemctl is-active "$lsvc" 2>/dev/null || echo "inactive")"
+        log_msg "INFO" "Logging service '$lsvc' status: $st"
+    done
+
+    # Check Rocky Linux log files (/var/log/maillog, /var/log/secure, /var/log/messages)
+    local rocky_logs=("/var/log/maillog" "/var/log/secure" "/var/log/messages" "/var/log/cron" "/var/log/audit/audit.log")
+    for lf in "${rocky_logs[@]}"; do
+        if [[ -f "$lf" ]]; then
+            local lstat
+            lstat="$(stat -c "%a %U:%G %s bytes" "$lf" 2>/dev/null)"
+            log_msg "OK" "Log file present: $lf ($lstat)"
+            if [[ "$mode" == "harden" ]]; then
+                require_root || return 1
+                run_cmd "Restricting permissions (0600) on $lf" chmod 600 "$lf"
+            fi
+        else
+            log_msg "WARN" "Expected Rocky Linux log file missing: $lf"
+        fi
+    done
+
+    # Ensure persistent systemd journal directory exists if hardening
+    if [[ "$mode" == "harden" ]]; then
+        require_root || return 1
+        if [[ ! -d /var/log/journal ]]; then
+            run_cmd "Creating persistent journal directory /var/log/journal" mkdir -p /var/log/journal
+            run_cmd "Applying systemd-tmpfiles to /var/log/journal" systemd-tmpfiles --create --prefix /var/log/journal
+            run_cmd "Restarting systemd-journald" systemctl restart systemd-journald
+        fi
+        if systemctl list-unit-files rsyslog.service >/dev/null 2>&1; then
+            run_cmd "Ensuring rsyslog is enabled and running" systemctl enable --now rsyslog
+        fi
+    fi
+}
+
+# ==============================================================================
+# 22. MODULE T: SELINUX (AND OPTIONAL APPARMOR CHECK)
+# ==============================================================================
+audit_selinux() {
+    print_header "MODULE T: SELINUX MANDATORY ACCESS CONTROL AUDIT (READ-ONLY)"
+
+    if command -v getenforce >/dev/null 2>&1; then
+        local enf
+        enf="$(getenforce 2>/dev/null)"
+        if [[ "$enf" == "Enforcing" ]]; then
+            log_msg "OK" "SELinux current mode: $enf"
+        else
+            log_msg "WARN" "SELinux current mode is '$enf' (Not Enforcing!)."
+        fi
+    else
+        log_msg "ALERT" "getenforce not found! SELinux tools may be missing."
+    fi
+
+    if command -v sestatus >/dev/null 2>&1; then
+        log_msg "INFO" "sestatus output:"
+        sestatus 2>/dev/null | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # Check SELinux file contexts on critical mail and auth paths (Read-only restorecon -nv)
+    if command -v restorecon >/dev/null 2>&1; then
+        log_msg "INFO" "Checking for SELinux file context mismatches on critical paths (restorecon -nv):"
+        local check_paths=("/etc/passwd" "/etc/shadow" "/etc/group" "/etc/gshadow" "/etc/ssh" "/etc/postfix" "/etc/dovecot" "/var/spool/mail" "/var/spool/postfix")
+        for cp in "${check_paths[@]}"; do
+            [[ -e "$cp" ]] || continue
+            local mis
+            mis="$(restorecon -Rnv "$cp" 2>/dev/null | head -n 20)"
+            if [[ -n "$mis" ]]; then
+                log_msg "WARN" "SELinux context mismatch detected under $cp:"
+                echo "$mis" | sed 's/^/  /' | tee -a "$LOG_FILE"
+            fi
+        done
+    fi
+
+    # Check recent SELinux AVC denials (last 15 minutes)
+    if command -v ausearch >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
+        log_msg "INFO" "Checking recent SELinux AVC denials (ausearch -m avc -ts recent):"
+        ausearch -m avc -ts recent 2>/dev/null | tail -n 20 | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+
+    # Only check AppArmor if explicitly installed
+    if command -v aa-status >/dev/null 2>&1; then
+        log_msg "WARN" "AppArmor tools detected on Rocky Linux:"
+        aa-status 2>/dev/null | head -n 10 | sed 's/^/  /' | tee -a "$LOG_FILE"
+    fi
+}
+
+# ==============================================================================
+# 23. FULL READ-ONLY BASELINE AUDIT & CONSERVATIVE HARDENING SUITES
+# ==============================================================================
+run_full_audit() {
+    print_header "STARTING FULL READ-ONLY SECURITY & MAIL BASELINE AUDIT"
+    verify_rocky_linux
+    audit_mail_stack
+    audit_users_and_accounts
+    audit_auth_policies
+    audit_sshd
+    audit_network_and_sysctl
+    audit_ftp
+    audit_and_harden_etc_permissions "audit"
+    audit_and_harden_sudoers "audit"
+    audit_packages_and_repos
+    audit_polkit
+    audit_scheduled_tasks
+    audit_display_manager
+    audit_grub_and_banners "audit"
+    audit_services_and_systemd
+    audit_listening_ports
+    audit_firewall
+    audit_selinux
+    audit_and_harden_logging "audit"
+    audit_malware_lightweight
+    print_header "FULL AUDIT COMPLETE — LOG SAVED TO: $LOG_FILE"
+}
+
+run_conservative_hardening() {
+    print_header "STARTING CONSERVATIVE HARDENING SUITE (DRY_RUN=${DRY_RUN})"
+    require_root || return 1
+    verify_rocky_linux
+    detect_mail_stack
+
+    audit_and_harden_etc_permissions "harden"
+    audit_and_harden_sudoers "harden"
+    harden_auth_policies
+    harden_sshd
+    harden_sysctl
+    harden_firewall
+    audit_grub_and_banners "harden"
+    audit_and_harden_logging "harden"
+
+    print_header "CONSERVATIVE HARDENING COMPLETE (DRY_RUN=${DRY_RUN})"
+    show_rollback_instructions
+}
+
+# ==============================================================================
+# 24. MAIN MENU AND EXECUTION FLOW
+# ==============================================================================
+toggle_dry_run() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        DRY_RUN=0
+        log_msg "WARN" "LIVE MODE ENABLED (DRY_RUN=0). Hardening actions WILL modify the system (with backups)."
+    else
+        DRY_RUN=1
+        log_msg "INFO" "DRY-RUN MODE ENABLED (DRY_RUN=1). No system files will be modified."
+    fi
+}
+
+display_menu() {
+    local mode_str="DRY-RUN (Safe Preview - No Changes)"
+    [[ $DRY_RUN -eq 0 ]] && mode_str="LIVE MODE (Applies Changes with Backups)"
+
+    echo ""
+    echo "=============================================================================="
+    echo " ROCKY LINUX CCDC MAIL SERVER SECURITY BASELINE"
+    echo " Execution Mode : $mode_str"
+    echo " Log File       : $LOG_FILE"
+    echo " Backup Path    : $BACKUP_ROOT"
+    echo "=============================================================================="
+    echo " [AUDIT - READ-ONLY MODULES]"
+    echo "   1) Run FULL Read-Only System & Mail Audit (Recommended First Step)"
+    echo "   2) Audit Mail Stack (Postfix/Dovecot/Queues/TLS/DNS/Storage)"
+    echo "   3) Audit Users, UID 0, Wheel Group & System Shells"
+    echo "   4) Audit PAM, authselect, pwquality & faillock"
+    echo "   5) Audit SSHD, network/sysctl, Listening Ports & Firewalld"
+    echo "   6) Audit /etc Permissions, Sudoers, Polkit, Cron & Systemd"
+    echo "   7) Audit SELinux, Logging & Lightweight Malware/RPM Integrity"
+    echo ""
+    echo " [HARDEN - CONSERVATIVE CONFIGURATION MODULES]"
+    echo "   8) Toggle DRY-RUN / LIVE Mode (Currently: $([[ $DRY_RUN -eq 1 ]] && echo "DRY-RUN" || echo "LIVE"))"
+    echo "   9) Run ALL Conservative Hardening Modules (Mail-Safe)"
+    echo "  10) Harden Core /etc Permissions & Sudoers"
+    echo "  11) Harden Password & Auth Policies (pwquality/faillock/login.defs)"
+    echo "  12) Harden SSHD Configuration (Validated via sshd -t)"
+    echo "  13) Harden Kernel & Network Sysctl (/etc/sysctl.d/)"
+    echo "  14) Harden Firewalld (Preserves SSH & Detected Mail Ports)"
+    echo "  15) Harden Logging & Login Banners"
+    echo ""
+    echo " [MAINTENANCE & ACCOUNT OPERATIONS (INTERACTIVE CONFIRMATION)]"
+    echo "  16) Reconcile Users & Privileges from Roster ($USER_ROSTER_FILE)"
+    echo "  17) Manage User Passwords & Aging Policies"
+    echo "  18) Check & Apply DNF Package Updates (dnf upgrade)"
+    echo "  19) Show Backup & Rollback Instructions"
+    echo "   0) Exit"
+    echo "=============================================================================="
+}
+
+main() {
+    init_logging
+
+    # Support CLI flags for non-interactive audit
+    if [[ "${1:-}" == "--audit" ]]; then
+        run_full_audit
+        exit 0
+    elif [[ "${1:-}" == "--live" ]]; then
+        DRY_RUN=0
+    fi
+
+    while true; do
+        display_menu
+        read -r -p "Select an option [0-19]: " choice
+        case "$choice" in
+            1)  run_full_audit ;;
+            2)  audit_mail_stack ;;
+            3)  audit_users_and_accounts ;;
+            4)  audit_auth_policies ;;
+            5)  audit_sshd; audit_network_and_sysctl; audit_listening_ports; audit_firewall ;;
+            6)  audit_and_harden_etc_permissions "audit"; audit_and_harden_sudoers "audit"; audit_polkit; audit_scheduled_tasks; audit_services_and_systemd ;;
+            7)  audit_selinux; audit_and_harden_logging "audit"; audit_malware_lightweight ;;
+            8)  toggle_dry_run ;;
+            9)  run_conservative_hardening ;;
+            10) audit_and_harden_etc_permissions "harden"; audit_and_harden_sudoers "harden" ;;
+            11) harden_auth_policies ;;
+            12) harden_sshd ;;
+            13) harden_sysctl ;;
+            14) harden_firewall ;;
+            15) audit_grub_and_banners "harden"; audit_and_harden_logging "harden" ;;
+            16) manage_user_accounts ;;
+            17) manage_user_passwords ;;
+            18) update_all_applications ;;
+            19) show_rollback_instructions ;;
+            0)  log_msg "INFO" "Exiting script."; exit 0 ;;
+            *)  log_msg "WARN" "Invalid selection: $choice" ;;
+        esac
+    done
+}
+
+main "$@"
