@@ -87,55 +87,33 @@ Review findings from **Options `2`, `6`, and `7**` to manually remediate persist
 ### 1. Audit Modules (Strictly Read-Only)
 
 | Menu | Function(s) | What It Checks |
-| --- | --- | --- |
-| **`1`** | `run_full_audit` | Executes all read-only audit modules below and writes a full report to `/var/log/ccdc_hardening/`. |
-| **`2`** | `audit_mail_stack` | Detects active mail services/ports, checks Postfix (`postconf`) for open relays and TLS keys, checks Dovecot (`doveconf`) auth settings, inspects mail spool permissions, and verifies DNS nameservers. |
-| **`3`** | `audit_users_and_accounts` | Flags non-root `UID 0` accounts, lists human users (`UID >= 1000`), alerts on system accounts (`UID < 1000`) with interactive login shells, lists `wheel` members, and checks `/etc/shadow` for empty passwords. |
-| **`4`** | `audit_auth_policies` | Checks `authselect` profile integrity, `/etc/security/pwquality.conf`, `/etc/security/faillock.conf` (`even_deny_root` risk), `/etc/login.defs`, and scans `/etc/pam.d/` for rogue `pam_permit.so` backdoors. |
-| **`5`** | `audit_sshd`<br>
-
-<br>`audit_network_and_sysctl`<br>
-
-<br>`audit_listening_ports`<br>
-
-<br>`audit_firewall` | Dumps effective `sshd -T` config, lists `/etc/ssh/sshd_config.d/` drop-ins, counts `~/.ssh/authorized_keys` per user, logs IPs/routes/sysctls, lists listening sockets (`ss -tlnp`/`-ulnp`), and dumps `firewalld`/`nftables` rules. |
-| **`6`** | `audit_and_harden_etc_permissions`<br>
-
-<br>`audit_and_harden_sudoers`<br>
-
-<br>`audit_polkit`<br>
-
-<br>`audit_scheduled_tasks`<br>
-
-<br>`audit_services_and_systemd` | Checks `/etc` permissions, world-writable files, SUID/SGID binaries, and immutable (`+i`) files; greps `sudoers` for `NOPASSWD`; audits Polkit rules; dumps all cron/at jobs and systemd timers; checks systemd unit overrides. |
-| **`7`** | `audit_selinux`<br>
-
-<br>`audit_and_harden_logging`<br>
-
-<br>`audit_malware_lightweight` | Checks `getenforce`/`sestatus`, runs dry-run `restorecon -Rnv` on mail/auth paths, checks recent `AVC` denials, verifies `/var/log/maillog` and `secure`, scans `/dev/shm` & `/tmp` for executables, checks `/etc/ld.so.preload`, runs `getcap`, and runs `rpm -V` on core packages. |
+| :--- | :--- | :--- |
+| **1** | `run_full_audit` | Executes all read-only audit modules below and writes a full report to `/var/log/ccdc_hardening/`. |
+| **2** | `audit_mail_stack` | Detects active mail services/ports, checks Postfix (`postconf`) for open relays and TLS keys, checks Dovecot (`doveconf`) auth settings, inspects mail spool permissions, and verifies DNS nameservers. |
+| **3** | `audit_users_and_accounts` | Flags non-root `UID 0` accounts, lists human users (`UID >= 1000`), alerts on system accounts (`UID < 1000`) with interactive login shells, lists `wheel` members, and checks `/etc/shadow` for empty passwords. |
+| **4** | `audit_auth_policies` | Checks `authselect` profile integrity, `/etc/security/pwquality.conf`, `/etc/security/faillock.conf` (`even_deny_root` risk), `/etc/login.defs`, and scans `/etc/pam.d/` for rogue `pam_permit.so` backdoors. |
+| **5** | `audit_sshd`, `audit_network_and_sysctl`, `audit_listening_ports`, `audit_firewall` | Dumps effective `sshd -T` config, lists `/etc/ssh/sshd_config.d/` drop-ins, counts `~/.ssh/authorized_keys` per user, logs IPs/routes/sysctls, lists listening sockets (`ss -tlnp`/`-ulnp`), and dumps `firewalld`/`nftables` rules. |
+| **6** | `audit_and_harden_etc_permissions`, `audit_and_harden_sudoers`, `audit_polkit`, `audit_scheduled_tasks`, `audit_services_and_systemd` | Checks `/etc` permissions, world-writable files, SUID/SGID binaries, and immutable (`+i`) files; greps `sudoers` for `NOPASSWD`; audits Polkit rules; dumps all cron/at jobs and systemd timers; checks systemd unit overrides. |
+| **7** | `audit_selinux`, `audit_and_harden_logging`, `audit_malware_lightweight` | Checks `getenforce`/`sestatus`, runs dry-run `restorecon -Rnv` on mail/auth paths, checks recent `AVC` denials, verifies `/var/log/maillog` and `secure`, scans `/dev/shm` & `/tmp` for executables, checks `/etc/ld.so.preload`, runs `getcap`, and runs `rpm -V` on core packages. |
 
 ---
 
 ### 2. Hardening & Maintenance Modules (Backed Up & Idempotent)
 
 | Menu | Function(s) | What It Modifies (When `DRY_RUN=0`) |
-| --- | --- | --- |
-| **`8`** | `toggle_dry_run` | Switches between `DRY-RUN` (preview only) and `LIVE MODE` (applies changes with automatic backups). |
-| **`9`** | `run_conservative_hardening` | Runs Options `10`, `11`, `12`, `13`, `14`, and `15` sequentially. |
-| **`10`** | `audit_and_harden_etc_permissions`<br>
-
-<br>`audit_and_harden_sudoers` | Removes rogue `chattr +i/+a` flags, sets strict permissions on core `/etc` files (`/etc/shadow` `0000`) without touching `/etc/postfix` or `/etc/dovecot`, and installs `/etc/sudoers.d/99-ccdc-baseline` after `visudo -cf` validation. |
-| **`11`** | `harden_auth_policies` | Writes complexity rules to `/etc/security/pwquality.conf.d/99-ccdc-baseline.conf`, sets `remember = 5` in `pwhistory.conf`, sets conservative `faillock.conf` (`deny=5, unlock_time=300`, no root lockout), and updates `/etc/login.defs` aging while preserving `MAIL_DIR /var/spool/mail`. |
-| **`12`** | `harden_sshd` | Sets `PermitRootLogin no`, `PermitEmptyPasswords no`, `MaxAuthTries 4`, and keeps `PasswordAuthentication yes` (for scoring checks). Validates with `sshd -t -f` before replacing `/etc/ssh/sshd_config` and reloading `sshd`. |
-| **`13`** | `harden_sysctl` | Validates supported keys against `/proc/sys/` and writes `/etc/sysctl.d/99-ccdc-mail-baseline.conf` (SYN cookies, `rp_filter`, ASLR, `suid_dumpable=0`, `kptr_restrict=2`, ICMP echo preserved, IPv6 preserved). |
-| **`14`** | `harden_firewall` | Enables `firewalld` and permits `ssh`, all actively listening mail TCP ports (`25, 465, 587, 110, 143, 993, 995`), and `http`/`https` (if `httpd`/`nginx` is active) in runtime and permanent configs. |
-| **`15`** | `audit_grub_and_banners`<br>
-
-<br>`audit_and_harden_logging` | Sets `0600 root:root` on `/boot/grub2/grub.cfg`, sets warning banners in `/etc/issue` and `/etc/issue.net`, sets `0600` on `/var/log/{maillog,secure,messages}`, creates `/var/log/journal`, and enables `rsyslog`. |
-| **`16`** | `manage_user_accounts` | Reconciles users against `users.txt`. Protects all system/mail service accounts (`postfix`, `dovecot`, `vmail`, etc.). Prompts before locking or removing unlisted human accounts. |
-| **`17`** | `manage_user_passwords` | Updates passwords for `users.txt` accounts via `0600` file, interactive hidden prompt, or `DEFAULT_COMP_PASSWORD`, resets `faillock` counters, and sets `chage` aging (`-m 1 -M 90 -W 7`). |
-| **`18`** | `update_all_applications` | Runs `dnf check-update` and prompts before executing `dnf upgrade -y --nobest` (no auto-reboot). |
-| **`19`** | `show_rollback_instructions` | Prints exact `cp -a` and `restorecon` commands to restore any file from `/var/backups/ccdc_hardening/<TIMESTAMP>/`. |
+| :--- | :--- | :--- |
+| **8** | `toggle_dry_run` | Switches between `DRY-RUN` (preview only) and `LIVE MODE` (applies changes with automatic backups). |
+| **9** | `run_conservative_hardening` | Runs Options `10`, `11`, `12`, `13`, `14`, and `15` sequentially. |
+| **10** | `audit_and_harden_etc_permissions`, `audit_and_harden_sudoers` | Removes rogue `chattr +i/+a` flags, sets strict permissions on core `/etc` files (`/etc/shadow` `0000`) without touching `/etc/postfix` or `/etc/dovecot`, and installs `/etc/sudoers.d/99-ccdc-baseline` after `visudo -cf` validation. |
+| **11** | `harden_auth_policies` | Writes complexity rules to `/etc/security/pwquality.conf.d/99-ccdc-baseline.conf`, sets `remember = 5` in `pwhistory.conf`, sets conservative `faillock.conf` (`deny=5, unlock_time=300`, no root lockout), and updates `/etc/login.defs` aging while preserving `MAIL_DIR /var/spool/mail`. |
+| **12** | `harden_sshd` | Sets `PermitRootLogin no`, `PermitEmptyPasswords no`, `MaxAuthTries 4`, and keeps `PasswordAuthentication yes` (for scoring checks). Validates with `sshd -t -f` before replacing `/etc/ssh/sshd_config` and reloading `sshd`. |
+| **13** | `harden_sysctl` | Validates supported keys against `/proc/sys/` and writes `/etc/sysctl.d/99-ccdc-mail-baseline.conf` (SYN cookies, `rp_filter`, ASLR, `suid_dumpable=0`, `kptr_restrict=2`, ICMP echo preserved, IPv6 preserved). |
+| **14** | `harden_firewall` | Enables `firewalld` and permits `ssh`, all actively listening mail TCP ports (`25, 465, 587, 110, 143, 993, 995`), and `http`/`https` (if `httpd`/`nginx` is active) in runtime and permanent configs. |
+| **15** | `audit_grub_and_banners`, `audit_and_harden_logging` | Sets `0600 root:root` on `/boot/grub2/grub.cfg`, sets warning banners in `/etc/issue` and `/etc/issue.net`, sets `0600` on `/var/log/{maillog,secure,messages}`, creates `/var/log/journal`, and enables `rsyslog`. |
+| **16** | `manage_user_accounts` | Reconciles users against `users.txt`. Protects all system/mail service accounts (`postfix`, `dovecot`, `vmail`, etc.). Prompts before locking or removing unlisted human accounts. |
+| **17** | `manage_user_passwords` | Updates passwords for `users.txt` accounts via `0600` file, interactive hidden prompt, or `DEFAULT_COMP_PASSWORD`, resets `faillock` counters, and sets `chage` aging (`-m 1 -M 90 -W 7`). |
+| **18** | `update_all_applications` | Runs `dnf check-update` and prompts before executing `dnf upgrade -y --nobest` (no auto-reboot). |
+| **19** | `show_rollback_instructions` | Prints exact `cp -a` and `restorecon` commands to restore any file from `/var/backups/ccdc_hardening/<TIMESTAMP>/`. |
 
 ---
 
