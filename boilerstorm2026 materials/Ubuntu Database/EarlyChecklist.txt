@@ -1,0 +1,17 @@
+- Change admin password 
+  - Lock root password 
+      - passwd -l root
+- List established network connections with the owning process. Note anything connecting out to an address outside 10.42.0.0/24, apart from the proxy and Splunk.
+  - sudo ss -tunp
+- Any account other than root with UID 0 is a backdoor
+- Look for potential malicious files within /etc/sudoers.d
+  - Edit rules with sudo visudo
+    - Look for NOPASSWD
+- Check cron
+  - crontab -l
+  - cat /etc/crontab --> System file
+  - sudo cat /etc/cron.d/* --> System folder
+  - sudo ls -la /etc/cron.hourly/ /etc/cron.daily/ /etc/cron.weekly/ /etc/cron.monthly/
+- PermitRootLogin no
+- Check for shell startup files 
+- Monitoring --> journalctl -u <service_name>
