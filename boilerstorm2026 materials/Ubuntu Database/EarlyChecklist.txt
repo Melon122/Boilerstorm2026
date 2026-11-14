@@ -1,5 +1,5 @@
 - Change admin password 
-  - Lock root password 
+  - Lock root password --> (Maybe hold off until the end)
       - passwd -l root
 - List established network connections with the owning process. Note anything connecting out to an address outside 10.42.0.0/24, apart from the proxy and Splunk.
   - sudo ss -tunp
@@ -15,3 +15,9 @@
 - PermitRootLogin no
 - Check for shell startup files 
 - Monitoring --> journalctl -u <service_name>
+- Check for second SSH backdoor
+  - sudo ss -tulpn | grep -i ssh
+- Port 3306 --> MySQL
+- Port 5432 --> PostgreSQL
+- Port 6379 --> Redis
+- 
