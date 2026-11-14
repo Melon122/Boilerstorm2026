@@ -135,8 +135,3 @@
 * "Chat" (generic idk why)
 
 ---
-
-## **Logins:**
-
-* **Username:** `admin` or `CLOSEDAI\admin`
-* **Password:** `Changeme2026!`
