@@ -1,7 +1,0 @@
-#!/bin/bash
-mkdir /var/log/user
-chmod 1777 /var/log/user
-
-# Optional GPG Encryption
-apt install haveged
-gpg --gen-key
