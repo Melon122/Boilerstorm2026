@@ -20,4 +20,6 @@
 - Port 3306 --> MySQL
 - Port 5432 --> PostgreSQL
 - Port 6379 --> Redis
+- Monitor a service's activity
+  - journalctl -u <service_name>
 - 
