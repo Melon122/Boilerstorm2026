@@ -1,0 +1,353 @@
+CCDC / BoilerStorm Blue Team Checklist 
+
+Host
+Role
+OS
+LAN
+Public
+cai-fw01
+Firewall
+OPNsense
+10.42.0.1
+10.100.N.1
+CAI-DC01
+DC, DNS
+Server 2025
+10.42.0.10
+10.100.N.10
+CAI-WEB01
+Web
+Server 2022
+10.42.0.20
+10.100.N.20
+cai-db01
+DB, app (Deputy)
+Ubuntu 26.04
+10.42.0.30
+10.100.N.30
+cai-mail01
+Mail
+Rocky 10
+10.42.0.40
+10.100.N.40
+
+
+0. Rules that cost points
+[ ] No AI near the machines or anything you submit. No exfiltration (no VirusTotal, no files or logs out). Screenshots for memos and reports are the only exception.
+[ ] No hostname or internal IP changes. No containers (Docker, Podman, LXC).
+[ ] Block single attacker IPs only, never subnets. Never allowlist only the scorer or fake a service (lose all points for that service).
+[ ] Scored account passwords change only via PCR in Quotient. admin and all non-scored accounts can change anytime.
+[ ] Do not touch the Splunk Universal Forwarder or the competition CA.
+[ ] Free or open source software only. Servers keep their roles.
+[ ] Late injects are not accepted. Incident reports due 16:00.
+[ ] Revert = -200 per machine. Scoring consult = -100. Help ticket = free.
+
+1. First 30 minutes
+[ ] [P1] Check Quotient, the team mailbox (itops@closedai.com), and the first inject. Note which AD users Quotient lists per check: those are scored accounts.
+[ ] [P1] Change admin on every host, the OPNsense UI, and the team mailbox. Unique password per host. Default is in the packet and Red Team has it.
+[ ] [P1] Change CLOSEDAI\admin on the DC.
+[ ] [P1] Type passwords at prompts, then clear PowerShell and shell history. A Nationals 2026 red teamer found a blue team's backdoor Domain Admin password in PowerShell history and used it for the rest of the event.
+[ ] [P1] Baseline every host before changing anything (users, groups, services, tasks, listening ports, processes, shares, firewall rules, startup items). Save locally with a timestamp.
+[ ] [P1] Check listening ports and established connections on every host.
+[ ] [P1] Back up the firewall config, then check management access and NAT.
+[ ] [P1] Hunt pre-planted persistence (the previous IT team resigned together): odd accounts, group nesting, new services and tasks, SSH keys, cron.
+[ ] [P2] Reset non-scored domain users, privileged first. Reset krbtgt twice.
+[ ] [P2] Turn on auditing (Section 2.7).
+[ ] After every change, watch the next 2 Quotient checks (they run every minute). If something goes red, undo the last change first.
+[ ] Start an incident report draft the moment you see real Red Team activity.
+One person drives a host at a time (Guacamole sessions are shared). Keep a change log: time, host, who, what, result.
+
+2. Windows Server 2025 DC (CAI-DC01), Tier 0
+DNS runs here for every machine. Back up zones before editing.
+2.1 Credentials
+[ ] [P1] CLOSEDAI\admin changed. Built-in Administrator (RID 500) strong password or disabled. Guest disabled.
+[ ] [P2] krbtgt reset twice. One DC means no replication wait, but all tickets die, so expect re-auth. The second reset kills forged golden tickets. At Nationals 2026 a golden ticket survived a day because the double rotation was never finished. Redo if you find DCSync or NTDS theft.
+[ ] [P2] DSRM password reset. Check DsrmAdminLogonBehavior was not changed.
+[ ] [P2] Non-scored users reset (privileged first). Scored users via PCR only.
+[ ] [P2] Rotate service account passwords. Remove ones you cannot justify.
+[ ] [P2] Hunt leaked passwords: description fields, SYSVOL scripts and GPP cPassword, shares, desktops, old IT notes.
+2.2 Groups and odd objects
+Review members (including nested) of: Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account Operators, Backup Operators, Server Operators, Print Operators, DnsAdmins (equals Domain Admin in practice), Group Policy Creator Owners, Cert Publishers, Key Admins, Remote Desktop Users, Remote Management Users. Put real admins in Protected Users once nothing scored depends on them.
+Tricks seen in real reports:
+[ ] [P1] Users in the Builtin container or odd OUs (a past report: hidden user "Admin admin" in Builtin).
+[ ] [P1] Look-alike group nested into Enterprise Admins (same report: group named "Computer" gave domain takeover; found with BloodHound).
+[ ] [P1] User objects whose name ends in $ (a backdoor DA named $ was used at Nationals 2026).
+[ ] [P1] Recently created accounts and groups (whenCreated, events 4720, 4728, 4732, 4756).
+[ ] [P2] Look-alike names (Administrater, admin1, svc_backup) and orphaned adminCount=1 accounts.
+2.3 Attributes and ACLs
+[ ] PasswordNotRequired, PasswordNeverExpires on privileged, reversible encryption, DES keys.
+[ ] DoesNotRequirePreAuth (AS-REP roast). SPNs on user accounts (Kerberoast): drop unneeded ones.
+[ ] Unconstrained delegation on non-DCs. Constrained delegation and RBCD (msDS-AllowedToActOnBehalfOfOtherIdentity), especially on the DC object.
+[ ] msDS-KeyCredentialLink (shadow credentials) and altSecurityIdentities on privileged accounts and the DC. SIDHistory anywhere. Logon scripts (scriptPath, profilePath).
+[ ] Mark privileged accounts "sensitive and cannot be delegated". Set ms-DS-MachineAccountQuota to 0.
+[ ] [P2] Who has Replicating Directory Changes (DCSync) rights? Only DCs and a real admin group.
+[ ] [P2] AdminSDHolder ACL for extra entries. GenericAll, WriteDacl, WriteOwner on the domain, DC OU, Domain Admins, krbtgt, and every GPO for non-admins.
+[ ] [P3] Cross-check with BloodHound CE, PingCastle, or Purple Knight if the event allows. Do not leave them running on a server.
+2.4 Server 2025 specific
+dMSA / BadSuccessor. Anyone who can create objects in an OU could create a delegated Managed Service Account, link it to a privileged account, and inherit its access. Works if any DC is Server 2025. Original path patched in CVE-2025-53779, but permission hygiene still matters.
+[ ] [P1] DC has the cumulative update with the CVE-2025-53779 fix.
+[ ] [P1] There should be zero dMSA objects. Any dMSA is suspect. Check its predecessor link (msDS-ManagedAccountPrecededByLink) and state (msDS-DelegatedMSAState); confirm attribute names in the Akamai post.
+[ ] [P2] Remove create-child rights on OUs for non-admins. Watch events 5137 and 5136 (needs Directory Service Changes auditing).
+New defaults (verify on the box, do not assume): Credential Guard on by default on eligible non-DC hardware. SMB signing required by default for outbound. LDAP channel binding when the client supports it, LDAP sealing after SASL binds. NTLMv1 removed, NTLM deprecated, SMB NTLM blocking available. WDigest deprecated. RC4 phasing out. Baseline v2602 disables Windows sudo.
+Scoring warning: cai-mail01 authenticates domain users for IMAP and webmail. Tightening LDAP, NTLM, or Kerberos on the DC can break those logins. Change one thing, watch IMAP, SMTP, and webmail checks for 2 cycles.
+2.5 Protocol hardening
+Item
+Target
+Check for breakage
+NTLM
+Audit first, then restrict
+Old clients, Linux joins
+LM auth level
+NTLMv2 only
+Samba, Linux clients
+SMBv1
+Off
+Low
+SMB signing
+Required
+SMB check
+LDAP signing, channel binding
+Require, test first
+Linux LDAP simple binds on 389
+Anonymous enumeration, null sessions
+Restrict
+Low
+LSA protection
+On
+Unsigned auth packages
+Kerberos encryption
+AES where possible
+RC4-only service accounts
+LLMNR, mDNS, NetBIOS over TCP
+Off
+Recheck SMB
+WPAD
+Block via DNS global query block list
+None
+DHCPv6 (mitm6)
+Filter in host firewall
+Low
+Print Spooler on DC
+Disabled
+None
+Remote Registry, PowerShell v2
+Off / removed
+None
+RDP
+NLA, restricted users, only if needed
+Scored RDP user
+Windows OpenSSH server
+Not running unless needed; check administrators_authorized_keys
+None
+Netlogon secure channel
+Enforce
+None on 2025
+
+2.6 GPO, DNS, shares, ADCS
+[ ] [P1] List every GPO and its links. Read Default Domain Policy and Default DC Policy for changes.
+[ ] [P1] Inside GPOs look for: immediate tasks, startup and logon scripts, software install, Restricted Groups or Local Users adding members, firewall off, Defender exclusions or disabled.
+[ ] [P1] GPO permissions: Authenticated Users or Domain Users with edit is a backdoor. Check SYSVOL and NETLOGON for new scripts.
+[ ] Lockout policy: moderate threshold with short auto-unlock. Red Team can lock scored accounts to cause outages.
+[ ] [P1] DNS: records match reality (mail, web, wpad, new SRV or TXT). Zone transfers restricted. Dynamic updates secure only. Check for a server-level plugin DLL (DnsAdmins trick).
+[ ] [P1] Shares: nothing Everyone-writable. Keep the files the SMB check reads readable and unchanged.
+[ ] [P2] If ADCS exists: template ACLs, "enrollee supplies subject", web enrollment over HTTPS with EPA. If not needed, do not install it.
+[ ] [P2] Watch free disk space on every host. Red Team filled a blue team's disk at Nationals to keep a service down.
+2.7 Auditing
+[ ] [P1] Advanced Audit Policy: credential validation, Kerberos, account management, DS changes and replication, logon/logoff, policy change, privilege use, process creation with command line.
+[ ] [P1] Raise Security log size so nothing rolls over before 16:00. Never clear logs (1102 or 104 means compromise).
+[ ] [P2] PowerShell script block logging. Sysmon if allowed.
+2.8 Detection map
+Sign
+Event
+First move
+New user, group member
+4720, 4728, 4732, 4756
+Verify, disable, note time
+Privileged password reset
+4724
+Was it you?
+Kerberoast
+4769, RC4 type
+Rotate account, drop SPN
+AS-REP roast
+4768, no pre-auth
+Fix flag
+DCSync
+4662 from a non-DC
+Get source IP, double krbtgt, remove rights
+Service installed
+7045, 4697
+Inspect path, stop, delete
+Task created
+4698, 4702
+Inspect actions, delete
+Log cleared
+1102, 104
+Treat as compromise
+Failed logons from one source
+4625, 4771, 4776
+Record IP, block that IP only
+AD object changed
+5136, 5137
+Check dMSA, GPO, ACL tampering
+Process creation
+4688, 4104
+Command-line context
+
+Also: patch everything you can (Windows Update, reboots cost uptime). Classes Red Teams use: Zerologon, PrintNightmare, noPac, PetitPotam/relay, ADCS template abuse, Kerberoasting, unconstrained delegation, DCSync, golden/silver tickets, BadSuccessor.
+
+3. Windows member server (CAI-WEB01, IIS)
+[ ] [P1] Local admin changed. Local Administrators reviewed. Listening ports mapped to processes.
+[ ] [P1] Windows Firewall on, inbound rules limited to what is scored. Defender on, exclusions list reviewed.
+[ ] [P1] Hash baseline of the web root. Recheck every 30 min. New or changed .aspx, .asp, .php, .ashx, .config, .dll are suspects. Check upload and temp folders for scripts.
+[ ] [P1] web.config and applicationHost.config: added handlers, modules (including native). App pools must not run as SYSTEM or a domain admin.
+[ ] [P2] Remove default sites. Directory browsing off. Request filtering on, drop WebDAV and TRACE. Remove version headers.
+[ ] [P2] Web root: app pool identity gets read only, write only on required data folders.
+[ ] [P2] Old TLS off in SCHANNEL, then confirm the HTTPS check. Update or remove vulnerable CMS plugins. Move DB secrets out of world-readable files.
+[ ] FTP (if present): a past report saw 65 failed logons (4625, type 8, cleartext) against admin and guest in one burst. Anonymous off unless scored, Guest disabled, users jailed to their folder, record source IPs and times.
+Local sweep (every Windows server), apply only after checking scoring impact: remove unknown users; password, lockout, and audit policy set; Debug programs and Act as part of OS restricted; no anonymous SAM or share enumeration; no blank-password network logon; UAC on; stop Telnet, SNMP (unless scored), Remote Registry, WebClient, Spooler (non-print), SSDP, UPnP; remove SMB1, Telnet client, TFTP, PowerShell v2; review shares; remove remote access tools (VNC, AnyDesk, TeamViewer), P2P, miners; AutoRun and Remote Assistance off.
+
+4. Windows persistence sweep (every Windows host, DC first, then hourly)
+Area
+Look for
+Accounts
+New users, new Administrators members, hidden or look-alike names, $ names
+Services
+New, changed paths, paths in Temp, AppData, ProgramData, Public, user folders
+Scheduled tasks
+New, SYSTEM, odd names under \Microsoft\Windows\, launching cmd, PowerShell, wscript, mshta
+Run, RunOnce, Winlogon (Shell, Userinit, Notify)
+Anything unexplained
+Startup folders
+Anything not in baseline
+IFEO
+Debugger values (used at Nationals 2026 with a scheduled task to keep DNS down)
+Accessibility binaries
+sethc, utilman, osk, Narrator, Magnify replaced by cmd or other (hash check)
+WMI subscriptions
+Filters, consumers, bindings in root\subscription
+COM hijack, AppInit DLLs
+Changed InprocServer32 paths
+LSA packages
+Unexpected DLLs in Authentication, Security, Notification Packages
+Other DLL hooks
+Time providers, print or port monitors, Netsh helpers, Active Setup
+PowerShell profiles, BITS jobs
+Anything unexpected
+Remote access
+sshd running, administrators_authorized_keys, new RDP or WinRM listeners or firewall rules
+Hosts file
+Redirects for DC, mail, update sites
+AD-level
+Golden ticket, DCSync rights, AdminSDHolder, SIDHistory, GPO backdoors, DCShadow, skeleton key, certificate mappings
+
+Free tools: Sysinternals (Autoruns, Process Explorer, TCPView, Process Monitor, Sysmon). Do not touch: Splunk Universal Forwarder, competition CA. White Team staff may log in for scoring or support; if unsure whether an unknown logon is staff, open a free Help ticket.
+
+5. Linux (cai-db01 Ubuntu 26.04, cai-mail01 Rocky 10)
+5.1 Both
+[ ] [P1] admin and root passwords changed at a prompt. Clear history.
+[ ] [P1] Accounts: extra UID 0, login shells on system users, empty passwords, sudo or wheel members, /etc/sudoers and /etc/sudoers.d/.
+[ ] [P1] SSH keys: authorized_keys for every user and root, plus any AuthorizedKeysFile or AuthorizedKeysCommand redirect. Remove unexplained keys.
+[ ] [P1] sshd config: OpenSSH takes the first value it sees, so check /etc/ssh/sshd_config.d/ drop-ins and the effective config. Check root login, password auth (a scored SSH check may need it), Match blocks, ForceCommand.
+[ ] [P1] Listening ports and owning processes. Established connections to unknown IPs. Processes from /tmp, /dev/shm, /var/tmp, or deleted binaries.
+[ ] [P1] Cron: root and all user crontabs, /etc/cron.*, /etc/cron.d, at, anacron. Check @reboot and reboot traps before removing keys or binaries (Nationals 2026 red team cron jobs rebooted hosts if their key was removed first).
+[ ] [P1] systemd: new or changed units and timers in /etc/systemd/system, /usr/lib/systemd/system, per-user. A past report: Python SSH worm as a root service with Restart=always, a config file in /etc listing target IPs, an installer in /usr/share, repeating messages in syslog.
+[ ] [P1] Other startup: rc.local, /etc/init.d, /etc/profile.d, /etc/environment, user rc files, ~/.ssh/rc, /etc/ssh/sshrc.
+[ ] [P2] PAM (pam_exec, modified pam_unix), /etc/ld.so.preload, kernel modules, udev rules, NetworkManager dispatcher scripts.
+[ ] [P2] SUID, SGID, file capabilities against a package-verified list. Package integrity. Added repos and package hooks.
+[ ] [P2] /etc/hosts, resolver, firewall and NAT rules (a hidden subnet turned up through NAT rules at Nationals 2026). Recent writes in /etc, /usr/bin, /usr/local, /opt, /var/www, homes.
+[ ] [P2] Host firewall on. auditd rules for sudoers, SSH config, cron, root execs. Disk space watch, and do not log every packet (a blue team's disk was filled this way).
+[ ] [P3] Cross-check with Lynis, rkhunter, chkrootkit, AIDE if allowed.
+5.2 Ubuntu 26.04 / database (cai-db01)
+[ ] 26.04 uses sudo-rs and rust-coreutils by default (GNU versions remain). Know which a path points to; either can be swapped. Chrony with NTS is the default time service; point it at the DC if NTS cannot reach out. OpenSSH 10.x has post-quantum defaults, so recheck the SSH check after changes. Keep AppArmor enforcing. Check /etc/apt/sources.list.d, apt.conf.d hooks, update-motd.d (runs as root).
+[ ] [P1] Change DB admin and app DB passwords, update the app config, confirm the DB check.
+[ ] [P1] List DB users. Remove anonymous, unknown, and broad % grants. Bind only as wide as needed (limit by single IPs).
+[ ] [P2] Check triggers, procedures, scheduled events, UDFs, and plugins for backdoors.
+[ ] [P2] Scheduled local dump backups with restricted permissions (a billing DB was wiped via authenticated API calls at Nationals 2026).
+[ ] [P2] Deputy app files and config for secrets and writable paths. If a chat or IRC daemon runs here, change oper and admin passwords.
+5.3 Rocky 10 / mail (cai-mail01)
+[ ] SELinux stays enforcing. Fix denials, do not disable. firewalld reviewed. Crypto policies are on by default and RHEL 10 DEFAULT no longer allows SHA-1 signatures, so recheck TLS scoring if you change policy. Check dnf repos and plugins. STIG and SCAP profiles exist for Rocky 10: read them, do not bulk-remediate a scored mail server.
+[ ] [P1] Team mailbox password changed. Check it now and every 15 min.
+[ ] [P1] Not an open relay (test from outside the LAN).
+[ ] [P1] /etc/aliases pipes to commands, users' .forward, procmail and Sieve rules that execute programs.
+[ ] [P1] Roundcube dirs: new or modified PHP (webshells), unknown plugins, config file permissions.
+[ ] [P2] Postfix main.cf and master.cf (extra services, transport maps, filters, mailbox_command). Dovecot passdb and userdb: do not break the AD login path the IMAP check uses. Require TLS for auth only after confirming the checks support it.
+[ ] [P2] Check the queue and maillog for relay attempts and auth failures.
+[ ] Nobody opens attachments or links from unknown senders. A past incident started with a malicious attachment in a social-engineering email. Verify "executive" requests through Quotient or the team mailbox only. Never give credentials in chat (a Nationals 2026 red team posed as Orange Team on internal chat and got a login).
+
+6. Firewall (OPNsense, cai-fw01), Tier 0
+[ ] [P1] Web UI admin changed. Check other users, API keys, SSH keys.
+[ ] [P1] Back up config (System, Configuration, Backups) before any change and after each stable stage.
+[ ] [P1] WAN "Block private networks" and bogon blocking can break scoring. Your WAN is 10.100.N.1, a private range, and the scorer and Red Team come from it. Recheck Quotient if either is on.
+[ ] [P1] Review NAT (port forwards, 1:1, outbound), rules on every interface, floating rules, aliases, disabled rules.
+[ ] [P1] Limit who reaches the web UI and SSH. Know the anti-lockout rule before reordering rules.
+[ ] [P2] Default-deny inbound to the LAN, allow only scored ports. Check services, cron, and plugins on the firewall.
+[ ] [P2] Block individual attacker IPs with proof. Log IP, time, evidence for the report.
+[ ] [P2] Logging on blocks and on management rules.
+[ ] [P3] IDS/IPS in alert mode first.
+Do not break the proxy path servers use for updates. Do not touch the proxy CA.
+
+7. Monitoring loop (every 15 min, one owner)
+[ ] Quotient: anything red or flapping (note start time). Mailbox. Inject due times.
+[ ] DC: new accounts, group changes, privileged logons, log clears, DCSync-like activity.
+[ ] All hosts: listening ports and connections vs baseline, new services, tasks, cron, SSH keys, disk space.
+[ ] Web root and Roundcube vs hash baseline. Firewall top blocked sources and rule changes.
+[ ] Keep all hosts on one time source. Reports without timestamps are discarded.
+
+8. Incident reports
+Must document real Red Team activity (stolen password login, malicious program, backdoor). Access Red Team already had at the start is reportable. Unused weak settings are not incidents, and frivolous or excessive reports lose points. A complete report wins back up to half of the deduction.
+Share
+For
+10%
+Proof of Red Team activity
+10%
+When it happened
+10%
+How and when detected
+10%
+Attack and impact
+10%
+How impact was mitigated
+50%
+Remediating the attack path. Not awarded if Red Team gets back the same way
+
+Steps: timestamp and screenshot proof first, contain, find the entry point, remove every persistence item, close the hole, verify, then write and submit on the "Incident reports" inject (open until 16:00). Submit as you go.
+To: Tomas Whelan, Director of IT and Security
+From: Team N
+RE: Incident Report <n>: <title>
+Affected hosts / Source IP / Destination IP, port, service / Accounts
+Initial access time / Detected (how, when) / Downtime / Contained at / Path closed at
+Summary (3-5 sentences)
+Timeline
+Evidence (annotated screenshots, timestamps visible)
+Impact
+Containment
+Remediation of the attack path
+Verification (why they cannot return the same way)
+
+9. Injects (half of the score: 4,000 points)
+[ ] PDF, addressed to Tomas Whelan, Director of IT and Security, team number only.
+[ ] If more than one file, the main memo must name each extra file. Cite anything adapted (URL is enough).
+[ ] Short, executive-readable, annotated screenshots with timestamps. Answer exactly what was asked, all of it.
+[ ] Written by you. The packet says Tomas has "a severe disdain for AI slop".
+[ ] Two people read the inject, one owner, one reviewer. Upload 10+ min early. No late submissions.
+To: Tomas Whelan, Director of IT and Security
+From: Team N
+RE: <inject title>
+Bottom line (1-2 sentences)
+What was asked (numbered parts)
+What we did (numbered, with Figure refs)
+Evidence (Figure 1, 2 ...)
+Additional files: <names or none>
+Sources: <URLs>
+Expect: policies (password, AUP, IR, patch, backup), asset inventory and network diagram, onboarding and offboarding the former IT team (hunt what they left), legal hold (the memo says records must be kept: do not delete mail, chat, logs, or DB data; raise log sizes; a revert wipes state), new service or DNS changes, log review with Splunk evidence, time sync, malware analysis memos, "how could this have been avoided", firewall rule review. Sponsor challenge (up to 2,000 points) appears mid-event: keep one person free for it.
+
+10. Tickets
+Captain only, https://tickets.purdueblue.team.
+Help (free): rules questions, "is this allowed?" (ask before acting), suspected scoring faults.
+Consult (-100): one check keeps failing after you tested it yourself from the public IP as the scored user.
+Revert (-200): beyond repair or deep persistence. Reverting restores every original weakness and implant, so re-harden right away. Save evidence and records first.
+Report any exploitable flaw in the competition systems and stop testing it. Possible bonus.
+11. Last hour
+[ ] 15:00 freeze risky changes. 15:15 confirm all injects uploaded. 15:30 finish all incident reports with proof and timestamps. 15:45 final sweep. 16:00 reports close.
+
